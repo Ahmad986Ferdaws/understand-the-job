@@ -1,0 +1,9 @@
+# Check out text files with LF on every platform. Windows checkouts with
+# CRLF break Vitest's import of hashbang scripts and the exact-text checks on
+# agent prompts, and the plugin's prompts should read the same everywhere.
+* text=auto eol=lf
+
+*.wasm binary
+*.png binary
+*.ico binary
+*.gif binary

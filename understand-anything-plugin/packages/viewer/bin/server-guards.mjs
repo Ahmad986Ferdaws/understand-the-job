@@ -169,7 +169,8 @@ export function relativizeNodePaths(raw, projectRoot) {
     if (typeof node?.filePath !== "string" || !path.isAbsolute(node.filePath)) return node;
     const rel = path.relative(projectRoot, node.filePath);
     const inside = rel !== "" && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
-    return { ...node, filePath: inside ? rel : path.basename(node.filePath) };
+    // Graph paths are POSIX-style on every platform; path.relative uses "\" on Windows.
+    return { ...node, filePath: inside ? rel.split(path.sep).join("/") : path.basename(node.filePath) };
   });
   return raw;
 }
