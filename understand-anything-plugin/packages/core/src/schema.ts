@@ -117,14 +117,12 @@ export const EDGE_TYPE_ALIASES: Record<string, string> = {
   subscribe: "subscribes",
   // Non-code aliases
   describes: "documents",
-  documented_by: "documents",
   creates: "provisions",
   exposes: "serves",
   listens: "serves",
   deploys_to: "deploys",
   migrates_to: "migrates",
   routes_to: "routes",
-  triggers_on: "triggers",
   fires: "triggers",
   defines: "defines_schema",
   // Domain aliases
@@ -147,6 +145,14 @@ export const EDGE_TYPE_ALIASES: Record<string, string> = {
   // Note: "implemented_by" is intentionally NOT aliased to "implements" —
   // it inverts edge direction (see commit fd0df15). The LLM should use
   // "implements" with correct source/target instead.
+};
+
+// Inverse aliases: the LLM wrote the relation from the other end
+// ("A documented_by B"), so mapping the type alone would reverse its meaning.
+// normalizeGraph renames the type AND swaps source/target.
+export const INVERSE_EDGE_TYPE_ALIASES: Record<string, string> = {
+  documented_by: "documents",
+  triggers_on: "triggers",
 };
 
 // Design edge aliases — applied only when the graph's kind is "design".
@@ -545,12 +551,18 @@ export function normalizeGraph(data: unknown): unknown {
 
   if (Array.isArray(d.edges)) {
     result.edges = (d.edges as Array<Record<string, unknown>>).map((edge) => {
-      if (
-        typeof edge === "object" &&
-        edge !== null &&
-        typeof edge.type === "string" &&
-        edge.type in edgeAliases
-      ) {
+      if (typeof edge !== "object" || edge === null || typeof edge.type !== "string") {
+        return edge;
+      }
+      if (Object.prototype.hasOwnProperty.call(INVERSE_EDGE_TYPE_ALIASES, edge.type)) {
+        return {
+          ...edge,
+          type: INVERSE_EDGE_TYPE_ALIASES[edge.type],
+          source: edge.target,
+          target: edge.source,
+        };
+      }
+      if (edge.type in edgeAliases) {
         return { ...edge, type: edgeAliases[edge.type] };
       }
       return edge;

@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -307,6 +307,44 @@ describe('extract-import-map.mjs — TypeScript / JavaScript resolver', () => {
       'src/lib/math.ts',
       'src/utils/greet.ts',
     ]);
+  });
+
+  it('follows re-exports and dynamic import() literals into the import map', () => {
+    projectRoot = setupTree({
+      'src/index.ts': [
+        `export * from './all';`,
+        `export * as ns from './named-ns';`,
+        `export { a, b as c } from './picked';`,
+        `export type { T } from './types';`,
+        `export const local = 1;`,
+        `export async function lazy() { return import('./lazy-chunk'); }`,
+        `const computed = (n: string) => import('./dyn/' + n);`,
+      ].join('\n') + '\n',
+      'src/all.ts': `export const all = 1;\n`,
+      'src/named-ns.ts': `export const n = 1;\n`,
+      'src/picked.ts': `export const a = 1;\nexport const b = 2;\n`,
+      'src/types.ts': `export type T = string;\n`,
+      'src/lazy-chunk.ts': `export const chunk = 1;\n`,
+      'src/dyn/x.ts': `export const x = 1;\n`,
+      'src/page.js': `export * from './all';\nexport const p = () => import('./lazy-chunk');\n`,
+    });
+
+    const files = [
+      'src/index.ts', 'src/all.ts', 'src/named-ns.ts', 'src/picked.ts', 'src/types.ts',
+      'src/lazy-chunk.ts', 'src/dyn/x.ts',
+    ].map(path => ({ path, language: 'typescript', fileCategory: 'code' }));
+    files.push({ path: 'src/page.js', language: 'javascript', fileCategory: 'code' });
+    const result = runScript(projectRoot, { projectRoot, files });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output.importMap['src/index.ts']).toEqual([
+      'src/all.ts',
+      'src/lazy-chunk.ts',
+      'src/named-ns.ts',
+      'src/picked.ts',
+      'src/types.ts',
+    ]);
+    expect(result.output.importMap['src/page.js']).toEqual(['src/all.ts', 'src/lazy-chunk.ts']);
   });
 
   it('resolves /index.ts barrel imports', () => {
@@ -2253,5 +2291,284 @@ describe('extract-import-map.mjs — deterministic stderr ordering across loader
     // Pre-PR-346 this fell out of sequential loader passes; post-fix it
     // falls out of buffering + ordered drain in buildResolutionContext.
     expect(tsLineIdx).toBeLessThan(composerLineIdx);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Path aliases: tsconfig `extends`, jsconfig.json, baseUrl-only imports, and
+// workspace package names.
+// ---------------------------------------------------------------------------
+describe('extract-import-map.mjs — path alias resolution', () => {
+  const roots = [];
+
+  afterEach(() => {
+    for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const languageOf = path => {
+    if (/\.(ts|tsx|mts|cts)$/.test(path)) return 'typescript';
+    if (/\.(js|jsx|mjs|cjs)$/.test(path)) return 'javascript';
+    return 'json';
+  };
+
+  // Build a tree, list every file (except node_modules, like the real scanner)
+  // in the inventory, run the script, and return the import map.
+  function importMapFor(tree, { projectRootDir } = {}) {
+    const base = setupTree(tree);
+    roots.push(base);
+    const projectRoot = projectRootDir ? join(base, projectRootDir) : base;
+    const files = Object.keys(tree)
+      .filter(path => !path.includes('node_modules/'))
+      .filter(path => !projectRootDir || path.startsWith(`${projectRootDir}/`))
+      .map(path => (projectRootDir ? path.slice(projectRootDir.length + 1) : path))
+      .map(path => ({
+        path,
+        language: languageOf(path),
+        fileCategory: /\.(json|yaml)$/.test(path) ? 'config' : 'code',
+      }));
+    const result = runScript(projectRoot, { projectRoot, files });
+    expect(result.status, result.stderr).toBe(0);
+    return { importMap: result.output.importMap, result, projectRoot, base };
+  }
+
+  it('resolves paths declared in an extended config relative to the declaring config', () => {
+    const { importMap } = importMapFor({
+      'tsconfig.base.json': JSON.stringify({
+        compilerOptions: { baseUrl: '.', paths: { '@shared/*': ['packages/shared/src/*'] } },
+      }),
+      'packages/app/tsconfig.json': JSON.stringify({
+        extends: '../../tsconfig.base.json',
+        compilerOptions: { outDir: 'dist' },
+      }),
+      'packages/app/src/main.ts': `import { util } from '@shared/util';\nexport const m = util;\n`,
+      'packages/shared/src/util.ts': `export const util = 1;\n`,
+    });
+    expect(importMap['packages/app/src/main.ts']).toEqual(['packages/shared/src/util.ts']);
+  });
+
+  it('resolves paths without baseUrl against the config that declares them', () => {
+    const { importMap } = importMapFor({
+      'configs/base.json': JSON.stringify({
+        compilerOptions: { paths: { '~/*': ['../src/*'] } },
+      }),
+      'tsconfig.json': JSON.stringify({ extends: './configs/base' }),
+      'src/index.ts': `import { a } from '~/a';\n`,
+      'src/a.ts': `export const a = 1;\n`,
+    });
+    expect(importMap['src/index.ts']).toEqual(['src/a.ts']);
+  });
+
+  it('lets the child replace inherited paths and baseUrl wholesale', () => {
+    const { importMap } = importMapFor({
+      'tsconfig.base.json': JSON.stringify({
+        compilerOptions: { baseUrl: '.', paths: { '@/*': ['parent/*'] } },
+      }),
+      'tsconfig.json': JSON.stringify({
+        extends: './tsconfig.base.json',
+        compilerOptions: { paths: { '@/*': ['child/*'] } },
+      }),
+      'src/index.ts': `import { v } from '@/v';\n`,
+      'parent/v.ts': `export const v = 'parent';\n`,
+      'child/v.ts': `export const v = 'child';\n`,
+    });
+    expect(importMap['src/index.ts']).toEqual(['child/v.ts']);
+  });
+
+  it('supports an array of extends (later entries win) and JSONC in the base config', () => {
+    const { importMap } = importMapFor({
+      'a.json': `{
+        // base options
+        "compilerOptions": { "baseUrl": "lib", "paths": { "@/*": ["first/*"], }, },
+      }`,
+      'b.json': JSON.stringify({ compilerOptions: { paths: { '@/*': ['second/*'] } } }),
+      'tsconfig.json': JSON.stringify({ extends: ['./a.json', './b.json'] }),
+      'src/index.ts': `import { v } from '@/v';\n`,
+      'lib/first/v.ts': `export const v = 1;\n`,
+      'lib/second/v.ts': `export const v = 2;\n`,
+    });
+    // baseUrl comes from a.json, paths from b.json (the later entry).
+    expect(importMap['src/index.ts']).toEqual(['lib/second/v.ts']);
+  });
+
+  it('survives extends cycles and missing extended files', () => {
+    const { importMap, result } = importMapFor({
+      'tsconfig.json': JSON.stringify({
+        extends: ['./one.json', './does-not-exist.json'],
+        compilerOptions: { baseUrl: '.', paths: { '@/*': ['src/*'] } },
+      }),
+      'one.json': JSON.stringify({ extends: './two.json' }),
+      'two.json': JSON.stringify({ extends: './one.json' }),
+      'src/index.ts': `import { a } from '@/a';\n`,
+      'src/a.ts': `export const a = 1;\n`,
+    });
+    expect(importMap['src/index.ts']).toEqual(['src/a.ts']);
+    expect(result.output.failures).toEqual([]);
+  });
+
+  it('reads a package-specifier extends from the project node_modules and expands ${configDir}', () => {
+    const { importMap } = importMapFor({
+      'node_modules/shared-config/tsconfig.json': JSON.stringify({
+        compilerOptions: { paths: { '@/*': ['${configDir}/src/*'] } },
+      }),
+      'tsconfig.json': JSON.stringify({ extends: 'shared-config/tsconfig.json' }),
+      'src/index.ts': `import { a } from '@/a';\n`,
+      'src/a.ts': `export const a = 1;\n`,
+    });
+    expect(importMap['src/index.ts']).toEqual(['src/a.ts']);
+  });
+
+  it('never reads an extended config outside the project root', () => {
+    const { importMap, result } = importMapFor({
+      'outside/tsconfig.json': JSON.stringify({
+        compilerOptions: { baseUrl: '.', paths: { '@out/*': ['src/*'] } },
+      }),
+      'project/tsconfig.json': JSON.stringify({ extends: '../outside/tsconfig.json' }),
+      'project/src/index.ts': `import { a } from '@out/a';\n`,
+      'project/src/a.ts': `export const a = 1;\n`,
+    }, { projectRootDir: 'project' });
+    expect(importMap['src/index.ts']).toEqual([]);
+    expect(result.stderr).toMatch(/extends "\.\.\/outside\/tsconfig\.json".*outside the project root/);
+  });
+
+  it('never follows a node_modules symlink out of the project root', () => {
+    const base = setupTree({
+      'outside/tsconfig.json': JSON.stringify({
+        compilerOptions: { baseUrl: '.', paths: { '@out/*': ['src/*'] } },
+      }),
+      'project/tsconfig.json': JSON.stringify({ extends: 'evil/tsconfig.json' }),
+      'project/src/index.ts': `import { a } from '@out/a';\n`,
+      'project/src/a.ts': `export const a = 1;\n`,
+    });
+    roots.push(base);
+    mkdirSync(join(base, 'project/node_modules'), { recursive: true });
+    symlinkSync(join(base, 'outside'), join(base, 'project/node_modules/evil'));
+    const projectRoot = join(base, 'project');
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/index.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'src/a.ts', language: 'typescript', fileCategory: 'code' },
+      ],
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output.importMap['src/index.ts']).toEqual([]);
+    expect(result.stderr).toMatch(/outside the project root/);
+  });
+
+  it('reads jsconfig.json for JavaScript projects', () => {
+    const { importMap } = importMapFor({
+      'jsconfig.json': JSON.stringify({
+        compilerOptions: { baseUrl: '.', paths: { '@/*': ['src/*'] } },
+      }),
+      'src/index.js': `import { a } from '@/a';\n`,
+      'src/a.js': `export const a = 1;\n`,
+    });
+    expect(importMap['src/index.js']).toEqual(['src/a.js']);
+  });
+
+  it('resolves baseUrl-only imports (no paths)', () => {
+    const { importMap } = importMapFor({
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: 'src' } }),
+      'src/app/main.ts': `import { m } from 'utils/math';\nimport React from 'react';\n`,
+      'src/utils/math.ts': `export const m = 1;\n`,
+    });
+    expect(importMap['src/app/main.ts']).toEqual(['src/utils/math.ts']);
+  });
+
+  it('falls back to an ancestor config when the nearest one declares no aliases', () => {
+    const { importMap } = importMapFor({
+      'tsconfig.json': JSON.stringify({
+        compilerOptions: { baseUrl: '.', paths: { '@/*': ['src/*'] } },
+      }),
+      'src/tests/tsconfig.json': JSON.stringify({ compilerOptions: { strict: true } }),
+      'src/tests/a.test.ts': `import { a } from '@/a';\n`,
+      'src/a.ts': `export const a = 1;\n`,
+    });
+    expect(importMap['src/tests/a.test.ts']).toEqual(['src/a.ts']);
+  });
+
+  it('keeps a per-package alias from leaking into a sibling package', () => {
+    const { importMap } = importMapFor({
+      'packages/foo/tsconfig.json': JSON.stringify({
+        compilerOptions: { baseUrl: '.', paths: { '@foo/*': ['src/*'] } },
+      }),
+      'packages/foo/src/y.ts': `export const y = 1;\n`,
+      'packages/bar/tsconfig.json': JSON.stringify({ compilerOptions: { strict: true } }),
+      'packages/bar/src/x.ts': `import { y } from '@foo/y';\n`,
+    });
+    expect(importMap['packages/bar/src/x.ts']).toEqual([]);
+  });
+
+  describe('workspace package names', () => {
+    const workspaceTree = extra => ({
+      'pnpm-workspace.yaml': `packages:\n  - 'packages/*'\n  - "!packages/legacy"\n# comment\n`,
+      'package.json': JSON.stringify({ name: 'root', private: true }),
+      'packages/ui/package.json': JSON.stringify({
+        name: '@acme/ui',
+        main: './dist/index.js',
+        types: './dist/index.d.ts',
+      }),
+      'packages/ui/src/index.ts': `export * from './button';\n`,
+      'packages/ui/src/button.tsx': `export const Button = 1;\n`,
+      'packages/core/package.json': JSON.stringify({
+        name: '@acme/core',
+        exports: {
+          '.': { types: './dist/index.d.ts', import: './dist/index.js' },
+          './util': './dist/util.js',
+          './features/*': './dist/features/*.js',
+        },
+      }),
+      'packages/core/src/index.ts': `export const core = 1;\n`,
+      'packages/core/src/util.ts': `export const util = 1;\n`,
+      'packages/core/src/features/a.ts': `export const a = 1;\n`,
+      'packages/legacy/package.json': JSON.stringify({ name: '@acme/legacy' }),
+      'packages/legacy/src/index.ts': `export const legacy = 1;\n`,
+      'examples/demo/package.json': JSON.stringify({ name: '@acme/demo' }),
+      'examples/demo/src/index.ts': `export const demo = 1;\n`,
+      ...extra,
+    });
+
+    it('resolves a pnpm workspace package name to its source entry', () => {
+      const { importMap } = importMapFor(workspaceTree({
+        'packages/app/package.json': JSON.stringify({ name: '@acme/app' }),
+        'packages/app/src/main.ts': [
+          `import { Button } from '@acme/ui';`,
+          `import { core } from '@acme/core';`,
+          `import { util } from '@acme/core/util';`,
+          `import { a } from '@acme/core/features/a';`,
+          `import { l } from '@acme/legacy';`,
+          `import { d } from '@acme/demo';`,
+          `import x from 'react';`,
+        ].join('\n') + '\n',
+      }));
+      expect(importMap['packages/app/src/main.ts']).toEqual([
+        'packages/core/src/features/a.ts',
+        'packages/core/src/index.ts',
+        'packages/core/src/util.ts',
+        'packages/ui/src/index.ts',
+      ]);
+    });
+
+    it('supports the npm/yarn `workspaces` field and subpaths without an exports map', () => {
+      const { importMap } = importMapFor({
+        'package.json': JSON.stringify({ name: 'root', workspaces: ['libs/*'] }),
+        'libs/math/package.json': JSON.stringify({ name: 'math-lib' }),
+        'libs/math/index.ts': `export const add = 1;\n`,
+        'libs/math/extra/sub.ts': `export const sub = 1;\n`,
+        'apps/web/main.ts': `import { add } from 'math-lib';\nimport { sub } from 'math-lib/extra/sub';\n`,
+      });
+      expect(importMap['apps/web/main.ts']).toEqual(['libs/math/extra/sub.ts', 'libs/math/index.ts']);
+    });
+
+    it('prefers tsconfig paths over the workspace package name', () => {
+      const { importMap } = importMapFor(workspaceTree({
+        'tsconfig.json': JSON.stringify({
+          compilerOptions: { baseUrl: '.', paths: { '@acme/ui': ['packages/ui/src/button.tsx'] } },
+        }),
+        'apps/web/main.ts': `import { Button } from '@acme/ui';\n`,
+      }));
+      expect(importMap['apps/web/main.ts']).toEqual(['packages/ui/src/button.tsx']);
+    });
   });
 });

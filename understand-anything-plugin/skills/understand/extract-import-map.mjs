@@ -40,9 +40,9 @@
  */
 
 import { createRequire } from 'node:module';
-import { dirname, resolve, join, posix, isAbsolute } from 'node:path';
+import { dirname, resolve, join, posix, isAbsolute, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 
 /**
@@ -270,6 +270,23 @@ function normalizeJsonc(raw) {
   return normalized.replace(/^\uFEFF/, '');
 }
 
+// Marker prefix for a path-alias target that was written as `${configDir}/...`.
+// Such a target is already project-relative, so the resolver must not anchor
+// it at baseUrl / the declaring config again.
+const CONFIG_DIR_TOKEN = '${configDir}';
+const ROOT_RELATIVE_MARK = '\0root:';
+const CONFIG_FILE_NAMES = new Set(['tsconfig.json', 'jsconfig.json']);
+const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
+const MAX_EXTENDS_DEPTH = 32;
+
+/**
+ * Parse one tsconfig.json / jsconfig.json and return only the declared
+ * (unresolved) fields that matter for import resolution:
+ *   { extends: string[], baseUrl?: string|null, paths?: Map|null }
+ * `undefined` means "not declared here" (inherit); `null` means the config
+ * explicitly reset the option. Returns `null` when both the comment-stripped
+ * and raw parses fail, so the caller can warn with the exact path at fault.
+ */
 function parseTsConfigText(raw) {
   const normalized = normalizeJsonc(raw);
   let parsed;
@@ -282,90 +299,423 @@ function parseTsConfigText(raw) {
       return null;
     }
   }
-  const compilerOptions = parsed?.compilerOptions ?? {};
-  const baseUrl = compilerOptions.baseUrl ?? '.';
-  const paths = new Map();
-  if (compilerOptions.paths && typeof compilerOptions.paths === 'object') {
-    for (const [alias, targets] of Object.entries(compilerOptions.paths)) {
-      if (Array.isArray(targets)) {
-        paths.set(alias, targets);
+  const compilerOptions =
+    parsed?.compilerOptions && typeof parsed.compilerOptions === 'object'
+      ? parsed.compilerOptions
+      : {};
+  const config = {
+    extends: (Array.isArray(parsed?.extends) ? parsed.extends : [parsed?.extends])
+      .filter(spec => typeof spec === 'string' && spec.length > 0),
+    baseUrl: undefined,
+    paths: undefined,
+  };
+  if ('baseUrl' in compilerOptions) {
+    config.baseUrl = typeof compilerOptions.baseUrl === 'string' ? compilerOptions.baseUrl : null;
+  }
+  if ('paths' in compilerOptions) {
+    const rawPaths = compilerOptions.paths;
+    if (rawPaths && typeof rawPaths === 'object' && !Array.isArray(rawPaths)) {
+      config.paths = new Map();
+      for (const [alias, targets] of Object.entries(rawPaths)) {
+        if (Array.isArray(targets)) {
+          config.paths.set(alias, targets.filter(target => typeof target === 'string'));
+        }
       }
+    } else if (rawPaths === null) {
+      config.paths = null;
     }
   }
-  return { baseUrl, paths };
+  return config;
 }
 
 /**
- * Load every `tsconfig.json` discovered in the input file list and parse
- * each. Returns `Map<dirPath, { baseUrl, paths }>` keyed by the
- * project-relative POSIX directory containing the tsconfig (empty string
- * for a root-level tsconfig.json).
+ * Safe, memoized reader for files under the project root. Every read is
+ * realpath-checked so a symlink (or a `..` extends) can never make the script
+ * read a config outside the project. Returns `{ text, reason }` where `reason`
+ * is null on success, else 'missing' | 'outside' | 'unreadable'.
+ */
+function createSafeReader(projectRoot) {
+  let rootReal;
+  try {
+    rootReal = realpathSync(projectRoot);
+  } catch {
+    rootReal = resolve(projectRoot);
+  }
+  const cache = new Map();
+  const isInside = real => {
+    const rel = relative(rootReal, real);
+    return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  };
+  const read = relPath => {
+    if (cache.has(relPath)) return cache.get(relPath);
+    let result;
+    if (!relPath || relPath.split('/').includes('..')) {
+      result = { text: null, reason: 'outside' };
+    } else {
+      try {
+        const real = realpathSync(join(rootReal, relPath));
+        if (!isInside(real)) {
+          result = { text: null, reason: 'outside' };
+        } else {
+          const stats = statSync(real);
+          result = stats.isFile() && stats.size <= MAX_CONFIG_BYTES
+            ? { text: readFileSync(real, 'utf-8'), reason: null }
+            : { text: null, reason: 'unreadable' };
+        }
+      } catch (err) {
+        result = { text: null, reason: err?.code === 'ENOENT' || err?.code === 'ENOTDIR' ? 'missing' : 'unreadable', error: err };
+      }
+    }
+    cache.set(relPath, result);
+    return result;
+  };
+  return { rootReal, read };
+}
+
+/**
+ * Locate the file a tsconfig `extends` entry points at, strictly inside the
+ * project root. Relative and absolute entries get TypeScript's implicit
+ * `.json`; package specifiers (`@tsconfig/node20/tsconfig.json`) are looked up
+ * in `node_modules` directories from the config's directory up to the project
+ * root only. Returns `{ path }` (project-relative POSIX), `{ outside: true }`
+ * when the target escapes the project root, or `null` when nothing is found.
+ */
+function resolveExtendsTarget(spec, fromDir, reader) {
+  const withJson = base =>
+    base.endsWith('.json') ? [base] : [`${base}.json`, `${base}/tsconfig.json`];
+  const candidates = [];
+  if (isAbsolute(spec)) {
+    const rel = relative(reader.rootReal, resolve(spec)).split(sep).join('/');
+    if (rel === '' || rel === '..' || rel.startsWith('../') || isAbsolute(rel)) {
+      return { outside: true };
+    }
+    candidates.push(...withJson(rel));
+  } else if (spec === '.' || spec === '..' || spec.startsWith('./') || spec.startsWith('../')) {
+    const target = posix.normalize(posix.join(fromDir || '.', spec));
+    if (target === '..' || target.startsWith('../')) return { outside: true };
+    candidates.push(...withJson(target));
+  } else {
+    for (let dir = fromDir; ; dir = dirOf(dir)) {
+      candidates.push(...withJson(dir ? `${dir}/node_modules/${spec}` : `node_modules/${spec}`));
+      if (!dir) break;
+    }
+  }
+  let outside = false;
+  for (const candidate of candidates) {
+    const read = reader.read(candidate);
+    if (read.text !== null) return { path: candidate };
+    if (read.reason === 'outside') outside = true;
+  }
+  return outside ? { outside: true } : null;
+}
+
+/** `${configDir}` expands to the directory of the config that is being resolved. */
+function expandConfigDir(value, finalDir) {
+  return value.startsWith(CONFIG_DIR_TOKEN)
+    ? posix.join(finalDir || '.', value.slice(CONFIG_DIR_TOKEN.length))
+    : null;
+}
+
+/** The options a single config declares itself, anchored in project-relative form. */
+function ownTsConfigOptions(config, configDir, finalDir) {
+  const own = {};
+  if (config.baseUrl !== undefined) {
+    if (config.baseUrl === null) {
+      own.baseUrl = null;
+    } else {
+      const expanded = expandConfigDir(config.baseUrl, finalDir);
+      // An absolute baseUrl can't be mapped into the project; ignore it.
+      const joined = expanded ?? (isAbsolute(config.baseUrl) ? null : posix.join(configDir || '.', config.baseUrl));
+      own.baseUrl = joined === null ? null : (posix.normalize(joined) === '.' ? '' : posix.normalize(joined));
+    }
+  }
+  if (config.paths !== undefined) {
+    own.paths = config.paths === null
+      ? null
+      : new Map([...config.paths].map(([alias, targets]) => [
+        alias,
+        targets.map(target => {
+          const expanded = expandConfigDir(target, finalDir);
+          return expanded === null ? target : `${ROOT_RELATIVE_MARK}${posix.normalize(expanded)}`;
+        }),
+      ]));
+    // Without a baseUrl, targets are relative to the config that declares paths.
+    own.pathsBase = configDir;
+  }
+  return own;
+}
+
+/** Child-over-parent merge: baseUrl and paths each replace the inherited value wholesale. */
+function overlayTsConfig(parent, child) {
+  const merged = { ...parent };
+  if ('baseUrl' in child) {
+    if (child.baseUrl === null) delete merged.baseUrl;
+    else merged.baseUrl = child.baseUrl;
+  }
+  if ('paths' in child) {
+    if (child.paths === null) {
+      delete merged.paths;
+      delete merged.pathsBase;
+    } else {
+      merged.paths = child.paths;
+      merged.pathsBase = child.pathsBase;
+    }
+  }
+  return merged;
+}
+
+/**
+ * Load every `tsconfig.json` / `jsconfig.json` discovered in the input file
+ * list and compute its EFFECTIVE alias settings, following `extends` (a string
+ * or, since TS 5.0, an array — later entries win; the config itself wins over
+ * everything it extends). Returns `Map<dirPath, { baseUrl?, paths, pathsBase }>`
+ * keyed by the project-relative POSIX directory containing the config (empty
+ * string for the root).
  *
- * `paths` keys keep their trailing `*` wildcards intact (e.g. `"@/*"`); the
- * resolver matches them by prefix. Values are arrays because tsconfig
- * allows multiple targets per alias.
+ *   - `baseUrl` is the project-relative directory it resolves to, taken from
+ *     whichever config in the chain declares it.
+ *   - `paths` keeps its trailing `*` wildcards intact (e.g. `"@/*"`) and
+ *     replaces an inherited `paths` entirely, as TypeScript does.
+ *   - `pathsBase` is the directory of the config that declared `paths`; targets
+ *     are anchored there when no baseUrl is in effect.
  *
- * WHY plural: pnpm/yarn workspace monorepos commonly carry per-package
- * tsconfig.json files with package-scoped `paths` aliases. Loading only
- * the root tsconfig would (1) miss aliases defined in sub-packages and
- * (2) erroneously apply root aliases to files in sub-packages that
- * redefine them. Per-importer walk-up is the only correct behavior.
+ * Safety: extended configs are only read from inside the project root
+ * (realpath-checked, so symlinks cannot escape either); an `extends` that
+ * resolves outside it is skipped with a Warning. Cycles and over-deep chains
+ * are cut. Extended configs that are missing or malformed are skipped; only a
+ * config listed in the inventory reports a failure.
  *
- * Returns an empty map if no tsconfigs are found — many JS-only projects
- * have none, and relative imports still resolve without one. On parse
- * failure for a specific tsconfig, emits a Warning: pointing at the bad
- * file and skips it (the rest of the project keeps working).
+ * WHY plural: pnpm/yarn workspace monorepos carry per-package configs with
+ * package-scoped `paths`; resolution walks up from each importer.
  *
- * Parse strategy (per-file, in parseTsConfigText):
- *   1. Try the comment-stripped text (handles JSONC-style tsconfigs).
- *   2. If that fails, retry the ORIGINAL raw text — recovers the case
- *      where the stripper damaged a string literal containing `//`.
- *   3. If both fail, warn and skip — that tsconfig contributes no aliases.
+ * Parse strategy (per-file, in parseTsConfigText): comment-stripped text
+ * first, then the raw text, else warn and skip.
  */
 async function loadTsConfigs(projectRoot, files) {
   const out = new Map();
   const warnings = [];
   const failures = [];
-  // Collect the candidate paths in the original file order before reading,
-  // so warning emit order matches the previous sequential implementation.
-  const candidates = [];
+  const warned = new Set();
+  const warn = message => {
+    if (warned.has(message)) return;
+    warned.add(message);
+    warnings.push(message);
+  };
+  const reader = createSafeReader(projectRoot);
+
+  // One config per directory; tsconfig.json wins over jsconfig.json.
+  const inventory = new Map();
   for (const f of files) {
     const p = toPosix(f.path);
     const base = p.includes('/') ? p.slice(p.lastIndexOf('/') + 1) : p;
-    if (base !== 'tsconfig.json') continue;
-    const absPath = join(projectRoot, p);
-    if (!existsSync(absPath)) continue;
-    candidates.push({ key: p, absPath });
+    if (!CONFIG_FILE_NAMES.has(base)) continue;
+    const dir = dirOf(p);
+    if (!inventory.has(dir) || base === 'tsconfig.json') inventory.set(dir, p);
   }
-  const reads = await readFilesParallel(candidates);
-  for (const { key: p, raw, err } of reads) {
-    if (err) {
-      failures.push({ path: p, stage: 'resolver-config-read', message: err.message });
-      // absPath isn't carried through the helper return shape; reconstruct it.
+
+  const parsedCache = new Map();
+  const loadParsed = rel => {
+    if (!parsedCache.has(rel)) {
+      const read = reader.read(rel);
+      parsedCache.set(rel, read.text === null
+        ? { read }
+        : { read, config: parseTsConfigText(read.text) });
+    }
+    return parsedCache.get(rel);
+  };
+
+  const effectiveConfig = (rel, finalDir, visiting) => {
+    const loaded = loadParsed(rel);
+    if (!loaded.config) {
+      if (loaded.read.text !== null) {
+        warn(
+          `Warning: extract-import-map: extended config ${join(reader.rootReal, rel)} ` +
+          `failed to parse — its path aliases will not be applied\n`,
+        );
+      }
+      return {};
+    }
+    if (visiting.has(rel) || visiting.size >= MAX_EXTENDS_DEPTH) return {};
+    visiting.add(rel);
+    const configDir = dirOf(rel);
+    let effective = {};
+    for (const spec of loaded.config.extends) {
+      const target = resolveExtendsTarget(spec, configDir, reader);
+      if (target?.outside) {
+        warn(
+          `Warning: extract-import-map: ${join(reader.rootReal, rel)} extends "${spec}", ` +
+          `which resolves outside the project root — skipped\n`,
+        );
+      } else if (target) {
+        effective = overlayTsConfig(effective, effectiveConfig(target.path, finalDir, visiting));
+      }
+    }
+    effective = overlayTsConfig(effective, ownTsConfigOptions(loaded.config, configDir, finalDir));
+    visiting.delete(rel);
+    return effective;
+  };
+
+  for (const [dir, p] of inventory) {
+    const loaded = loadParsed(p);
+    const base = p.includes('/') ? p.slice(p.lastIndexOf('/') + 1) : p;
+    if (loaded.read.reason === 'missing') continue;
+    if (loaded.read.reason === 'outside') {
+      warn(
+        `Warning: extract-import-map: ${base} at ${join(projectRoot, p)} resolves outside ` +
+        `the project root — path aliases from this config will not be applied\n`,
+      );
+      continue;
+    }
+    if (loaded.read.text === null) {
+      const message = loaded.read.error?.message ?? 'unreadable';
+      failures.push({ path: p, stage: 'resolver-config-read', message });
       warnings.push(
-        `Warning: extract-import-map: tsconfig.json at ${join(projectRoot, p)} failed ` +
-        `to read (${err.message}) — path aliases from this config will ` +
+        `Warning: extract-import-map: ${base} at ${join(projectRoot, p)} failed ` +
+        `to read (${message}) — path aliases from this config will ` +
         `not be applied — relative imports unaffected\n`,
       );
       continue;
     }
-    const parsed = parseTsConfigText(raw);
-    if (!parsed) {
+    if (!loaded.config) {
       failures.push({
         path: p,
         stage: 'resolver-config-parse',
-        message: 'invalid tsconfig.json',
+        message: `invalid ${base}`,
       });
       warnings.push(
-        `Warning: extract-import-map: tsconfig.json at ${join(projectRoot, p)} failed ` +
+        `Warning: extract-import-map: ${base} at ${join(projectRoot, p)} failed ` +
         `to parse — path aliases from this config will not be applied ` +
         `— relative imports unaffected\n`,
       );
       continue;
     }
-    out.set(dirOf(p), parsed);
+    const effective = effectiveConfig(p, dir, new Set());
+    if (effective.baseUrl !== undefined || (effective.paths && effective.paths.size > 0)) {
+      out.set(dir, {
+        baseUrl: effective.baseUrl,
+        paths: effective.paths ?? new Map(),
+        pathsBase: effective.pathsBase ?? dir,
+      });
+    }
   }
   return { configs: out, warnings, failures };
+}
+
+// ---------------------------------------------------------------------------
+// Workspace packages (pnpm / npm / yarn workspaces)
+// ---------------------------------------------------------------------------
+
+function unquoteYamlScalar(value) {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^(['"])(.*)\1$/);
+  return match ? match[2] : trimmed;
+}
+
+/** The `packages:` globs of a pnpm-workspace.yaml (block or inline list). */
+function parsePnpmWorkspacePatterns(raw) {
+  const patterns = [];
+  let inPackages = false;
+  for (const line of raw.split(/\r?\n/)) {
+    const text = line.replace(/\s+#.*$/, '');
+    if (/^\s*(#.*)?$/.test(text)) continue;
+    const inline = text.match(/^packages\s*:\s*\[(.*)\]\s*$/);
+    if (inline) {
+      for (const item of inline[1].split(',')) {
+        const value = unquoteYamlScalar(item);
+        if (value) patterns.push(value);
+      }
+      inPackages = false;
+    } else if (/^packages\s*:\s*$/.test(text)) {
+      inPackages = true;
+    } else if (inPackages) {
+      const item = text.match(/^\s*-\s*(.+?)\s*$/);
+      if (item) patterns.push(unquoteYamlScalar(item[1]));
+      else if (/^\S/.test(text)) inPackages = false;
+    }
+  }
+  return patterns;
+}
+
+/** Directory glob (`packages/*`, `apps/**`) -> RegExp over a relative POSIX dir. */
+function workspaceGlobToRegExp(pattern) {
+  const glob = pattern.replace(/^\.\//, '').replace(/\/+$/, '');
+  let source = '';
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i];
+    if (ch === '*' && glob[i + 1] === '*') {
+      if (glob[i + 2] === '/') {
+        source += '(?:.*/)?';
+        i += 2;
+      } else {
+        source += '.*';
+        i += 1;
+      }
+    } else if (ch === '*') {
+      source += '[^/]*';
+    } else if (ch === '?') {
+      source += '[^/]';
+    } else {
+      source += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  return new RegExp(`^${source}$`);
+}
+
+/**
+ * Map workspace package names (`@acme/ui`) to the package's directory and
+ * manifest. Only packages matched by a declared workspace glob count (root
+ * package.json `workspaces`, or a sibling pnpm-workspace.yaml), so an unrelated
+ * example/fixture package.json can't shadow a real npm package name.
+ */
+async function loadWorkspacePackages(projectRoot, files) {
+  const packages = new Map();
+  const fileSet = new Set(files.map(f => toPosix(f.path)));
+  const reader = createSafeReader(projectRoot);
+  const manifestPaths = [...fileSet]
+    .filter(p => p === 'package.json' || p.endsWith('/package.json'))
+    .sort(comparePaths);
+
+  const manifests = new Map();
+  for (const p of manifestPaths) {
+    const read = reader.read(p);
+    if (read.text === null) continue;
+    try {
+      const parsed = JSON.parse(read.text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) manifests.set(dirOf(p), parsed);
+    } catch {
+      // A malformed package.json just contributes no workspace information.
+    }
+  }
+
+  const workspaceRoots = [];
+  for (const [dir, manifest] of manifests) {
+    let patterns = [];
+    if (Array.isArray(manifest.workspaces)) patterns = manifest.workspaces;
+    else if (Array.isArray(manifest.workspaces?.packages)) patterns = manifest.workspaces.packages;
+    const yamlPath = dir ? `${dir}/pnpm-workspace.yaml` : 'pnpm-workspace.yaml';
+    if (fileSet.has(yamlPath)) {
+      const yaml = reader.read(yamlPath);
+      if (yaml.text !== null) patterns = [...patterns, ...parsePnpmWorkspacePatterns(yaml.text)];
+    }
+    patterns = patterns.filter(pattern => typeof pattern === 'string' && pattern.length > 0);
+    if (patterns.length === 0) continue;
+    workspaceRoots.push({
+      dir,
+      include: patterns.filter(p => !p.startsWith('!')).map(workspaceGlobToRegExp),
+      exclude: patterns.filter(p => p.startsWith('!')).map(p => workspaceGlobToRegExp(p.slice(1))),
+    });
+  }
+
+  for (const { dir: rootDir, include, exclude } of workspaceRoots) {
+    for (const [dir, manifest] of manifests) {
+      if (dir === rootDir || typeof manifest.name !== 'string' || !manifest.name) continue;
+      if (rootDir && !dir.startsWith(`${rootDir}/`)) continue;
+      const rel = rootDir ? dir.slice(rootDir.length + 1) : dir;
+      if (!include.some(re => re.test(rel)) || exclude.some(re => re.test(rel))) continue;
+      if (!packages.has(manifest.name)) packages.set(manifest.name, { dir, manifest });
+    }
+  }
+  return { packages, warnings: [], failures: [] };
 }
 
 /**
@@ -577,9 +927,12 @@ function findNearestConfigDir(startDir, configMap) {
 /**
  * Resolution context shared across all per-file resolver calls. Holds:
  *  - fileSet: Set<string> of every input file's posix path
- *  - tsConfigs: Map<dir, { baseUrl, paths }> from every tsconfig.json in
- *    `files[]`. Per-import resolution walks up from the importer to the
- *    nearest enclosing tsconfig.
+ *  - tsConfigs: Map<dir, { baseUrl, paths, pathsBase }> of the effective
+ *    (`extends`-merged) settings of every tsconfig.json / jsconfig.json in
+ *    `files[]`. Per-import resolution walks up from the importer through the
+ *    enclosing configs.
+ *  - workspacePackages: Map<packageName, { dir, manifest }> for pnpm/npm/yarn
+ *    workspace members.
  *  - goModules: Map<dir, moduleName> from every go.mod in `files[]`.
  *  - phpAutoloads: Map<dir, autoloadMap> from every composer.json in
  *    `files[]`. Resolved paths are anchored at the composer's directory.
@@ -604,13 +957,15 @@ async function buildResolutionContext(projectRoot, files) {
   // flaky. Drain the buffers in canonical order *after* Promise.all, so
   // a fixture with `(malformed tsconfig.json, malformed composer.json)`
   // always emits `tsconfig…\ncomposer…\n`, never the reverse.
-  const [tsResult, goResult, phpResult, swiftResult] = await Promise.all([
+  const [tsResult, goResult, phpResult, swiftResult, workspaceResult] = await Promise.all([
     loadTsConfigs(projectRoot, files),
     loadGoModules(projectRoot, files),
     loadPhpAutoloads(projectRoot, files),
     loadSwiftPackageTargets(projectRoot, files),
+    loadWorkspacePackages(projectRoot, files),
   ]);
   for (const w of tsResult.warnings) process.stderr.write(w);
+  for (const w of workspaceResult.warnings) process.stderr.write(w);
   for (const w of goResult.warnings) process.stderr.write(w);
   for (const w of phpResult.warnings) process.stderr.write(w);
   for (const w of swiftResult.warnings) process.stderr.write(w);
@@ -646,6 +1001,7 @@ async function buildResolutionContext(projectRoot, files) {
     projectRoot,
     fileSet,
     tsConfigs,
+    workspacePackages: workspaceResult.packages,
     goModules,
     goFilesByDir,
     javaIndex,
@@ -656,6 +1012,7 @@ async function buildResolutionContext(projectRoot, files) {
     swiftModuleIndex,
     failures: [
       ...tsResult.failures,
+      ...workspaceResult.failures,
       ...goResult.failures,
       ...phpResult.failures,
       ...swiftResult.failures,
@@ -744,13 +1101,141 @@ function probeWithExtensions(basePath, fileSet) {
 }
 
 /**
+ * Resolve a bare specifier through ONE effective tsconfig/jsconfig: `paths`
+ * aliases first, then (when a baseUrl is in effect) a baseUrl-relative lookup.
+ * Alias targets are anchored at baseUrl when set, otherwise at the directory of
+ * the config that declared `paths`.
+ */
+function resolveViaTsConfig(src, config, ctx) {
+  const { baseUrl, paths, pathsBase } = config;
+  const anchor = baseUrl !== undefined ? baseUrl : (pathsBase ?? '');
+  if (paths && paths.size > 0) {
+    for (const [alias, targets] of paths) {
+      const aliasMatch = matchTsAlias(alias, src);
+      if (aliasMatch === null) continue;
+      for (const target of targets) {
+        const mapped = applyTsAlias(target, aliasMatch);
+        // posix.normalize strips a leading "./" left over when both the anchor
+        // and the target start at the project root (root tsconfig with
+        // `"@/*": ["./*"]`, the create-next-app default). Without this the
+        // candidate stays as "./foo" while ctx.fileSet stores "foo", and
+        // probeWithExtensions silently drops every cross-module edge.
+        const candidate = mapped.startsWith(ROOT_RELATIVE_MARK)
+          ? posix.normalize(mapped.slice(ROOT_RELATIVE_MARK.length))
+          : posix.normalize(anchor ? posix.join(anchor, mapped) : mapped);
+        // Defensive: alias targets shouldn't escape the project root.
+        if (candidate.startsWith('..')) continue;
+        const probed = probeWithExtensions(candidate, ctx.fileSet);
+        if (probed) return probed;
+      }
+    }
+  }
+  if (baseUrl !== undefined) {
+    // Non-relative imports are also looked up relative to baseUrl
+    // (`baseUrl: "src"` makes `import 'utils/math'` mean `src/utils/math`).
+    const candidate = posix.normalize(baseUrl ? posix.join(baseUrl, src) : src);
+    if (!candidate.startsWith('..')) {
+      const probed = probeWithExtensions(candidate, ctx.fileSet);
+      if (probed) return probed;
+    }
+  }
+  return null;
+}
+
+// Output directories whose contents are built from `src/` (package.json
+// `main: ./dist/index.js` -> source `src/index.ts`).
+const BUILD_OUTPUT_DIR_RE = /^(?:dist|lib|build|out|esm|cjs|types)\/(.*)$/;
+
+/** Collect every string leaf of a package.json `exports` value, in key order. */
+function collectExportTargets(value, out, wildcard = '', depth = 0) {
+  if (depth > 8 || value === null || value === undefined) return;
+  if (typeof value === 'string') {
+    out.push(applyTsAlias(value, wildcard));
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectExportTargets(item, out, wildcard, depth + 1);
+  } else if (typeof value === 'object') {
+    for (const key of Object.keys(value)) collectExportTargets(value[key], out, wildcard, depth + 1);
+  }
+}
+
+/** Package-relative entry candidates for `<name>` (sub === '') or `<name>/<sub>`. */
+function workspaceEntryCandidates(manifest, sub) {
+  const out = [];
+  const exportsField = manifest.exports;
+  if (exportsField !== undefined && exportsField !== null) {
+    const isSubpathMap = typeof exportsField === 'object'
+      && !Array.isArray(exportsField)
+      && Object.keys(exportsField).some(key => key.startsWith('.'));
+    const subpath = sub ? `./${sub}` : '.';
+    if (isSubpathMap) {
+      if (Object.hasOwn(exportsField, subpath)) {
+        collectExportTargets(exportsField[subpath], out);
+      } else {
+        for (const key of Object.keys(exportsField)) {
+          if (!key.includes('*')) continue;
+          const wildcard = matchTsAlias(key, subpath);
+          if (wildcard !== null) collectExportTargets(exportsField[key], out, wildcard);
+        }
+      }
+    } else if (!sub) {
+      collectExportTargets(exportsField, out);
+    }
+  }
+  if (sub) {
+    out.push(sub, `src/${sub}`);
+  } else {
+    for (const field of ['module', 'main', 'types', 'typings']) {
+      if (typeof manifest[field] === 'string') out.push(manifest[field]);
+    }
+    out.push('src/index', 'index');
+  }
+  return out;
+}
+
+/**
+ * Resolve an import of a workspace package name (`@acme/ui`, `@acme/ui/button`)
+ * to a source file in the inventory. Entry points usually name build output
+ * (`./dist/index.js`, `./dist/index.d.ts`) that is not in the inventory, so
+ * each candidate is also tried against `src/`.
+ */
+function resolveWorkspaceImport(src, ctx) {
+  const workspace = ctx.workspacePackages;
+  if (!workspace || workspace.size === 0) return null;
+  const parts = src.split('/');
+  const nameLength = src.startsWith('@') ? 2 : 1;
+  if (parts.length < nameLength || parts.slice(0, nameLength).some(part => !part)) return null;
+  const pkg = workspace.get(parts.slice(0, nameLength).join('/'));
+  if (!pkg) return null;
+
+  for (const entry of workspaceEntryCandidates(pkg.manifest, parts.slice(nameLength).join('/'))) {
+    const entryPath = entry.replace(/^\.\//, '');
+    const variants = [entryPath];
+    const built = entryPath.match(BUILD_OUTPUT_DIR_RE);
+    if (built) variants.push(`src/${built[1]}`);
+    for (const variant of variants) {
+      // `index.d.ts` declares `index.ts`; probe the extensionless stem.
+      const stems = [variant];
+      if (/\.d\.[mc]?ts$/.test(variant)) stems.push(variant.replace(/\.d\.[mc]?ts$/, ''));
+      for (const stem of stems) {
+        const candidate = posix.normalize(pkg.dir ? posix.join(pkg.dir, stem) : stem);
+        if (candidate.startsWith('..')) continue;
+        const probed = probeWithExtensions(candidate, ctx.fileSet);
+        if (probed) return probed;
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Resolve a TypeScript / JavaScript import. Returns project-relative resolved
  * path or null. External packages return null.
  *
- * Path-alias resolution walks up from the importer's directory to find the
- * nearest enclosing tsconfig.json (monorepo-friendly). `baseUrl`-relative
- * targets are anchored at THAT tsconfig's directory, matching the way the
- * TypeScript compiler resolves nested project configs.
+ * Bare specifiers are tried against the importer's tsconfig.json/jsconfig.json
+ * (with `extends` already merged by loadTsConfigs), walking from the nearest
+ * enclosing config up to the project root: a nearer config that declares no
+ * alias must not hide an ancestor's. Then workspace package names (pnpm/npm/
+ * yarn workspaces) resolve to the package's entry.
  */
 export function resolveTsJsImport(rawImport, file, ctx) {
   if (!rawImport || typeof rawImport !== 'string') return null;
@@ -765,50 +1250,15 @@ export function resolveTsJsImport(rawImport, file, ctx) {
     return probeWithExtensions(base, ctx.fileSet);
   }
 
-  // tsconfig path aliases. Walk up from the importer to find the nearest
-  // tsconfig.json; resolve targets relative to THAT tsconfig's directory.
-  // Without the walk-up, a root tsconfig would either swallow aliases that
-  // belong to a sub-package or fail to apply sub-package-defined aliases.
-  const tsConfigDir = findNearestConfigDir(importerDir, ctx.tsConfigs);
-  if (tsConfigDir !== undefined) {
-    const tsConfig = ctx.tsConfigs.get(tsConfigDir);
-    const { baseUrl, paths } = tsConfig;
-    if (paths && paths.size > 0) {
-      for (const [alias, targets] of paths) {
-        const aliasMatch = matchTsAlias(alias, src);
-        if (aliasMatch === null) continue;
-        for (const target of targets) {
-          const mapped = applyTsAlias(target, aliasMatch);
-          // baseUrl is tsconfig-dir-relative; '.', './', '' all mean the
-          // tsconfig's own directory. We anchor at tsConfigDir so a nested
-          // tsconfig's `baseUrl: '.'` maps to its package, not project root.
-          const normalizedBase = baseUrl === '.' || baseUrl === ''
-            ? ''
-            : toPosix(baseUrl);
-          const relativeToConfig = normalizedBase
-            ? posix.join(normalizedBase, mapped)
-            : mapped;
-          // posix.normalize strips a leading "./" left over when both
-          // tsConfigDir and normalizedBase are empty (root tsconfig with
-          // `"@/*": ["./*"]`, the create-next-app default). Without this the
-          // candidate stays as "./foo" while ctx.fileSet stores "foo", and
-          // probeWithExtensions silently drops every cross-module edge.
-          const candidate = posix.normalize(
-            tsConfigDir
-              ? posix.join(tsConfigDir, relativeToConfig)
-              : relativeToConfig,
-          );
-          // Defensive: tsconfig targets shouldn't escape the project root.
-          if (candidate.startsWith('..')) continue;
-          const probed = probeWithExtensions(candidate, ctx.fileSet);
-          if (probed) return probed;
-        }
-      }
-    }
+  const parts = importerDir ? importerDir.split('/').filter(Boolean) : [];
+  for (let i = parts.length; i >= 0; i--) {
+    const config = ctx.tsConfigs.get(parts.slice(0, i).join('/'));
+    if (!config) continue;
+    const resolved = resolveViaTsConfig(src, config, ctx);
+    if (resolved) return resolved;
   }
 
-  // Bare specifier with no leading `./`, no alias match -> external package.
-  return null;
+  return resolveWorkspaceImport(src, ctx);
 }
 
 /**

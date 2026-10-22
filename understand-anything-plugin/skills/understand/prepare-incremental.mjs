@@ -95,7 +95,11 @@ function isGeneratedArtifact(path) {
 
 function isImportResolverConfig(path) {
   const name = path.split('/').at(-1);
-  return name === 'tsconfig.json'
+  // tsconfig.base.json and friends are reached through `extends`; package.json
+  // and pnpm-workspace.yaml define workspace package names and entry points.
+  return /^[jt]sconfig(\..+)?\.json$/.test(name)
+    || name === 'package.json'
+    || name === 'pnpm-workspace.yaml'
     || name === 'go.mod'
     || name === 'composer.json'
     || name === 'Package.swift';
@@ -419,14 +423,26 @@ function refreshImportMap({ projectRoot, intermediateDir, previousScan, currentS
   return importMap;
 }
 
-function pruneExistingGraph(graph, pathsToReplace, importPathsToRefresh = new Set()) {
-  const removedNodeIds = new Set();
+// `reanalyzedPaths` is the subset of `pathsToReplace` that will be re-analyzed
+// (deleted files are in `pathsToReplace` but never come back). File-analyzer
+// agents only emit OUTBOUND edges for the files they analyze, so an edge from a
+// retained node into a re-analyzed file (calls, documents, configures,
+// inherits, ...) is carried through here; merge and finalize drop it only if
+// the target node no longer exists after the re-analysis.
+function pruneExistingGraph(
+  graph,
+  pathsToReplace,
+  importPathsToRefresh = new Set(),
+  reanalyzedPaths = pathsToReplace,
+) {
+  const reanalyzedNodeIds = new Set();
   const refreshedImportSourceIds = new Set();
   const nodes = [];
   for (const node of graph?.nodes ?? []) {
     const path = normalizeRelativePath(node?.filePath);
-    if (path && pathsToReplace.has(path)) removedNodeIds.add(node.id);
-    else {
+    if (path && pathsToReplace.has(path)) {
+      if (reanalyzedPaths.has(path)) reanalyzedNodeIds.add(node.id);
+    } else {
       nodes.push(node);
       if (
         path
@@ -439,14 +455,11 @@ function pruneExistingGraph(graph, pathsToReplace, importPathsToRefresh = new Se
     }
   }
   const retainedIds = new Set(nodes.map(node => node.id));
-  const edges = (graph?.edges ?? []).filter(
-    edge =>
-      !removedNodeIds.has(edge.source)
-      && !removedNodeIds.has(edge.target)
-      && !(edge.type === 'imports' && refreshedImportSourceIds.has(edge.source))
-      && retainedIds.has(edge.source)
-      && retainedIds.has(edge.target),
-  );
+  const edges = (graph?.edges ?? []).filter(edge => {
+    if (edge.type === 'imports' && refreshedImportSourceIds.has(edge.source)) return false;
+    if (!retainedIds.has(edge.source)) return false;
+    return retainedIds.has(edge.target) || reanalyzedNodeIds.has(edge.target);
+  });
   return { nodes, edges };
 }
 
@@ -712,7 +725,12 @@ async function main() {
     const pathsToReplace = new Set([...filesToReanalyze, ...deletedFiles]);
     atomicWriteJson(
       join(intermediateDir, 'batch-existing.json'),
-      pruneExistingGraph(baselineGraph, pathsToReplace, new Set(importAnalysisPaths)),
+      pruneExistingGraph(
+        baselineGraph,
+        pathsToReplace,
+        new Set(importAnalysisPaths),
+        new Set(filesToReanalyze),
+      ),
     );
   }
   atomicWriteJson(join(intermediateDir, 'incremental-plan.json'), plan);

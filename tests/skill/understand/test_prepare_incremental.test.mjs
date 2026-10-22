@@ -12,7 +12,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '../../..');
@@ -922,6 +922,43 @@ describe('prepare-incremental.mjs', { timeout: 30_000 }, () => {
     expect(scan.importMap['src/index.ts']).toEqual(['alternate/foo.ts']);
   });
 
+  it('re-resolves unchanged importers when an extended config changes', () => {
+    const { root, baseCommit } = setupRepository({
+      'tsconfig.base.json': JSON.stringify({
+        compilerOptions: { baseUrl: '.', paths: { '@/*': ['src/*'] } },
+      }),
+      'tsconfig.json': JSON.stringify({ extends: './tsconfig.base.json' }),
+      'src/index.ts': "import { value } from '@/foo';\nexport { value };\n",
+      'src/foo.ts': 'export const value = 1;\n',
+      'alternate/foo.ts': 'export const value = 2;\n',
+      'src/a.ts': 'export const a = 1;\n',
+    });
+    writeProjectFile(root, 'tsconfig.base.json', JSON.stringify({
+      compilerOptions: { baseUrl: '.', paths: { '@/*': ['alternate/*'] } },
+    }));
+    commit(root, 'change alias target in the base config');
+
+    const { plan, scan } = prepare(root, baseCommit);
+    expect(scan.importMap['src/index.ts']).toEqual(['alternate/foo.ts']);
+    expect(plan.importMapRefreshPaths).toContain('src/index.ts');
+  });
+
+  it.each([
+    ['tsconfig.json', true],
+    ['jsconfig.json', true],
+    ['packages/app/tsconfig.base.json', true],
+    ['tsconfig.app.json', true],
+    ['package.json', true],
+    ['pnpm-workspace.yaml', true],
+    ['go.mod', true],
+    ['src/tsconfig-notes.md', false],
+    ['src/mytsconfig.json', false],
+    ['src/index.ts', false],
+  ])('classifies %s as an import-resolver config: %s', async (path, expected) => {
+    const { isImportResolverConfig } = await import(pathToFileURL(prepareScript).href);
+    expect(isImportResolverConfig(path)).toBe(expected);
+  });
+
   it('aborts without advancing baselines when import extraction reports a config failure', () => {
     const { root, baseCommit } = setupRepository({
       'tsconfig.json': JSON.stringify({
@@ -1531,5 +1568,134 @@ describe('finalize-incremental.mjs', { timeout: 30_000 }, () => {
     expect(readFileSync(graphPath, 'utf-8')).toBe(graphBefore);
     expect(readFileSync(fingerprintPath, 'utf-8')).toBe(fingerprintsBefore);
     expect(readFileSync(metaPath, 'utf-8')).toBe(metaBefore);
+  });
+});
+
+describe('incremental runs keep inbound edges to re-analyzed files', { timeout: 30_000 }, () => {
+  const symbolNode = (id, filePath, name) => ({
+    id, type: 'function', name, filePath, summary: name, tags: [], complexity: 'simple',
+  });
+
+  function inboundFixture() {
+    const f = setupRepository({
+      'src/a.ts': "import { validate } from './b';\nexport function handler() { return validate(); }\n",
+      'src/b.ts': 'export function validate() { return true; }\n',
+      'src/c.ts': 'export const c = 3;\n',
+      'docs/guide.md': '# Guide\n',
+    });
+    const dataDir = join(f.root, '.ua');
+    const graphPath = join(dataDir, 'knowledge-graph.json');
+    const graph = JSON.parse(readFileSync(graphPath, 'utf-8'));
+    const handler = symbolNode('function:src/a.ts:handler', 'src/a.ts', 'handler');
+    const validate = symbolNode('function:src/b.ts:validate', 'src/b.ts', 'validate');
+    graph.nodes.push(handler, validate);
+    graph.edges.push(
+      { source: 'file:src/a.ts', target: handler.id, type: 'contains', direction: 'forward', weight: 1 },
+      { source: 'file:src/b.ts', target: validate.id, type: 'contains', direction: 'forward', weight: 1 },
+      { source: handler.id, target: validate.id, type: 'calls', direction: 'forward', weight: 0.8 },
+      { source: 'file:docs/guide.md', target: validate.id, type: 'documents', direction: 'forward', weight: 0.6 },
+      { source: 'file:src/c.ts', target: 'file:src/b.ts', type: 'configures', direction: 'forward', weight: 0.5 },
+    );
+    writeFileSync(graphPath, JSON.stringify(graph), 'utf-8');
+    const intermediate = join(dataDir, 'intermediate');
+    return { ...f, graphPath, intermediate, handler, validate };
+  }
+
+  const hasEdge = (graph, source, target, type) =>
+    graph.edges.some(edge => edge.source === source && edge.target === target && edge.type === type);
+
+  it('carries calls/documents/configures edges from unchanged files through prepare, merge, and finalize', () => {
+    const f = inboundFixture();
+    writeProjectFile(
+      f.root,
+      'src/b.ts',
+      'export function validate() { return true; }\nexport function extra() { return 2; }\n',
+    );
+    const head = commit(f.root, 'extend b');
+    const { plan } = prepare(f.root, f.baseCommit);
+    expect(plan.filesToReanalyze).toEqual(['src/b.ts']);
+
+    const retained = JSON.parse(readFileSync(join(f.intermediate, 'batch-existing.json'), 'utf-8'));
+    expect(retained.nodes.map(node => node.id)).not.toContain(f.validate.id);
+    expect(hasEdge(retained, f.handler.id, f.validate.id, 'calls')).toBe(true);
+    expect(hasEdge(retained, 'file:docs/guide.md', f.validate.id, 'documents')).toBe(true);
+    expect(hasEdge(retained, 'file:src/c.ts', 'file:src/b.ts', 'configures')).toBe(true);
+    // Outbound edges of the re-analyzed file are re-emitted by the analyzer, not kept.
+    expect(hasEdge(retained, 'file:src/b.ts', f.validate.id, 'contains')).toBe(false);
+
+    const bFile = JSON.parse(readFileSync(f.graphPath, 'utf-8')).nodes.find(node => node.id === 'file:src/b.ts');
+    const extra = symbolNode('function:src/b.ts:extra', 'src/b.ts', 'extra');
+    writeFileSync(join(f.intermediate, 'batch-0.json'), JSON.stringify({
+      nodes: [bFile, f.validate, extra],
+      edges: [
+        { source: bFile.id, target: f.validate.id, type: 'contains', direction: 'forward', weight: 1 },
+        { source: bFile.id, target: extra.id, type: 'contains', direction: 'forward', weight: 1 },
+      ],
+    }), 'utf-8');
+    run(python, [mergeScript, f.root], f.root);
+    run(process.execPath, [finalizeScript, f.root], f.root);
+
+    const graph = JSON.parse(readFileSync(f.graphPath, 'utf-8'));
+    expect(graph.project.gitCommitHash).toBe(head);
+    expect(hasEdge(graph, f.handler.id, f.validate.id, 'calls')).toBe(true);
+    expect(hasEdge(graph, 'file:docs/guide.md', f.validate.id, 'documents')).toBe(true);
+    expect(hasEdge(graph, 'file:src/c.ts', 'file:src/b.ts', 'configures')).toBe(true);
+    expect(graph.nodes.some(node => node.id === extra.id)).toBe(true);
+  });
+
+  it('drops a carried inbound edge only when its target no longer exists after re-analysis', () => {
+    const f = inboundFixture();
+    writeProjectFile(f.root, 'src/b.ts', 'export function renamedHelper(input: number) { return input * 2; }\n');
+    commit(f.root, 'remove validate');
+    prepare(f.root, f.baseCommit);
+    const retained = JSON.parse(readFileSync(join(f.intermediate, 'batch-existing.json'), 'utf-8'));
+    expect(hasEdge(retained, f.handler.id, f.validate.id, 'calls')).toBe(true);
+
+    const bFile = JSON.parse(readFileSync(f.graphPath, 'utf-8')).nodes.find(node => node.id === 'file:src/b.ts');
+    const helper = symbolNode('function:src/b.ts:renamedHelper', 'src/b.ts', 'renamedHelper');
+    writeFileSync(join(f.intermediate, 'batch-0.json'), JSON.stringify({
+      nodes: [bFile, helper],
+      edges: [{ source: bFile.id, target: helper.id, type: 'contains', direction: 'forward', weight: 1 }],
+    }), 'utf-8');
+    run(python, [mergeScript, f.root], f.root);
+    run(process.execPath, [finalizeScript, f.root], f.root);
+
+    const graph = JSON.parse(readFileSync(f.graphPath, 'utf-8'));
+    expect(graph.nodes.some(node => node.id === f.validate.id)).toBe(false);
+    expect(graph.edges.some(edge => edge.source === f.handler.id || edge.target === f.validate.id)).toBe(false);
+    // The edge into the surviving file node is still carried.
+    expect(hasEdge(graph, 'file:src/c.ts', 'file:src/b.ts', 'configures')).toBe(true);
+  });
+
+  it('finalize drops a carried inbound edge whose target vanished without a merge pass', () => {
+    const f = inboundFixture();
+    writeProjectFile(f.root, 'src/b.ts', 'export function renamedHelper(input: number) { return input * 2; }\n');
+    commit(f.root, 'remove validate');
+    prepare(f.root, f.baseCommit);
+    const retained = JSON.parse(readFileSync(join(f.intermediate, 'batch-existing.json'), 'utf-8'));
+    const bFile = JSON.parse(readFileSync(f.graphPath, 'utf-8')).nodes.find(node => node.id === 'file:src/b.ts');
+    const helper = symbolNode('function:src/b.ts:renamedHelper', 'src/b.ts', 'renamedHelper');
+    writeFileSync(join(f.intermediate, 'assembled-graph.json'), JSON.stringify({
+      nodes: [...retained.nodes, bFile, helper],
+      edges: [
+        ...retained.edges,
+        { source: bFile.id, target: helper.id, type: 'contains', direction: 'forward', weight: 1 },
+      ],
+    }), 'utf-8');
+    run(process.execPath, [finalizeScript, f.root], f.root);
+    const graph = JSON.parse(readFileSync(f.graphPath, 'utf-8'));
+    const ids = new Set(graph.nodes.map(node => node.id));
+    expect(graph.edges.every(edge => ids.has(edge.source) && ids.has(edge.target))).toBe(true);
+    expect(graph.edges.some(edge => edge.target === f.validate.id)).toBe(false);
+    expect(hasEdge(graph, 'file:src/c.ts', 'file:src/b.ts', 'configures')).toBe(true);
+  });
+
+  it('does not carry inbound edges whose target file was deleted', () => {
+    const f = inboundFixture();
+    unlinkSync(join(f.root, 'src/b.ts'));
+    commit(f.root, 'delete b');
+    prepare(f.root, f.baseCommit);
+    const retained = JSON.parse(readFileSync(join(f.intermediate, 'batch-existing.json'), 'utf-8'));
+    expect(retained.edges.some(edge => edge.target === f.validate.id || edge.target === 'file:src/b.ts')).toBe(false);
   });
 });

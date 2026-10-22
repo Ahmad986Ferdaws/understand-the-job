@@ -126,6 +126,8 @@ export class TypeScriptExtractor implements LanguageExtractor {
       );
     }
 
+    this.extractDynamicImports(rootNode, imports);
+
     return { functions, classes, imports, exports };
   }
 
@@ -356,6 +358,88 @@ export class TypeScriptExtractor implements LanguageExtractor {
     }
   }
 
+  /**
+   * Record `import('./x')` calls whose argument is a plain string literal.
+   * They can sit anywhere in the file (lazy routes, plugin loaders), so this
+   * is a separate whole-tree pass. Computed and interpolated specifiers are
+   * unresolvable and skipped.
+   */
+  private extractDynamicImports(
+    rootNode: TreeSitterNode,
+    imports: StructuralAnalysis["imports"],
+  ): void {
+    // Iterative pre-order walk (source order) so deep ASTs cannot overflow the stack.
+    const stack: TreeSitterNode[] = [rootNode];
+    while (stack.length > 0) {
+      const node = stack.pop()!;
+      if (node.type === "comment" || node.type === "string") continue;
+
+      if (node.type === "call_expression") {
+        const callee = node.childForFieldName("function");
+        if (callee && callee.type === "import") {
+          const source = this.dynamicImportSource(node);
+          if (source) {
+            imports.push({
+              source,
+              specifiers: [],
+              lineNumber: node.startPosition.row + 1,
+            });
+          }
+        }
+      }
+
+      for (let i = node.childCount - 1; i >= 0; i--) {
+        const child = node.child(i);
+        if (child) stack.push(child);
+      }
+    }
+  }
+
+  private dynamicImportSource(callNode: TreeSitterNode): string | null {
+    const args =
+      callNode.childForFieldName("arguments") ??
+      callNode.children.find((c) => c.type === "arguments");
+    if (!args) return null;
+    const first = args.children.find(
+      (c) => c.type !== "(" && c.type !== ")" && c.type !== "," && c.type !== "comment",
+    );
+    if (!first) return null;
+    if (first.type === "string") return getStringValue(first) || null;
+    if (
+      first.type === "template_string" &&
+      !first.children.some((c) => c.type === "template_substitution")
+    ) {
+      return first.text.slice(1, -1) || null;
+    }
+    return null;
+  }
+
+  /**
+   * Specifiers of a re-export (`export ... from '...'`): `*` for a star
+   * re-export, `* as ns` for a namespace re-export, otherwise the names as
+   * they appear in the source module (the public alias is recorded in exports).
+   */
+  private extractReExportSpecifiers(node: TreeSitterNode): string[] {
+    const specifiers: string[] = [];
+    for (const child of node.children) {
+      if (child.type === "*") {
+        specifiers.push("*");
+      } else if (child.type === "namespace_export") {
+        const ident = child.children.find(
+          (c) => c.type === "identifier" || c.type === "string",
+        );
+        specifiers.push(ident ? "* as " + ident.text : "*");
+      } else if (child.type === "export_clause") {
+        for (const spec of child.children) {
+          if (spec.type !== "export_specifier") continue;
+          const name = spec.childForFieldName("name");
+          specifiers.push(name ? name.text : spec.text);
+        }
+      }
+    }
+    return specifiers;
+  }
+
   private extractImport(
     node: TreeSitterNode,
     imports: StructuralAnalysis["imports"],
@@ -386,10 +470,26 @@ export class TypeScriptExtractor implements LanguageExtractor {
     node: TreeSitterNode,
     functions: StructuralAnalysis["functions"],
     classes: StructuralAnalysis["classes"],
-    _imports: StructuralAnalysis["imports"],
+    imports: StructuralAnalysis["imports"],
     exports: StructuralAnalysis["exports"],
     exportedNames: Set<string>,
   ): void {
+    // `export * from './x'`, `export { a } from './x'`, `export * as ns from './x'`
+    // pull in another module, so they are imports for dependency purposes. The
+    // `from` token separates a source from `export default "literal"`.
+    const fromIndex = node.children.findIndex((c) => c.type === "from");
+    const reExportSource =
+      fromIndex === -1
+        ? undefined
+        : node.children.slice(fromIndex + 1).find((c) => c.type === "string");
+    if (reExportSource) {
+      imports.push({
+        source: getStringValue(reExportSource),
+        specifiers: this.extractReExportSpecifiers(node),
+        lineNumber: node.startPosition.row + 1,
+      });
+    }
+
     for (let j = 0; j < node.childCount; j++) {
       const child = node.child(j);
       if (!child) continue;

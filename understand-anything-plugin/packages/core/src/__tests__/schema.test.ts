@@ -5,6 +5,7 @@ import {
   autoFixGraph,
   NODE_TYPE_ALIASES,
   EDGE_TYPE_ALIASES,
+  INVERSE_EDGE_TYPE_ALIASES,
 } from "../schema.js";
 import type { KnowledgeGraph } from "../types.js";
 
@@ -717,6 +718,81 @@ describe("Extended node/edge types", () => {
       expect(result.success).toBe(true);
       expect(result.data!.edges[0].type).toBe(canonical);
     }
+  });
+
+  describe("inverse edge type aliases swap source and target", () => {
+    const twoNodeGraph = () => {
+      const graph = structuredClone(validGraph);
+      graph.nodes.push({
+        id: "node-2",
+        type: "document",
+        name: "README.md",
+        filePath: "README.md",
+        summary: "Docs",
+        tags: [],
+        complexity: "simple",
+      });
+      return graph;
+    };
+
+    it.each([
+      ["documented_by", "documents"],
+      ["triggers_on", "triggers"],
+    ])("normalizes %s to %s with source/target swapped", (alias, canonical) => {
+      const graph = twoNodeGraph();
+      graph.edges = [{
+        source: "node-1",
+        target: "node-2",
+        type: alias as any,
+        direction: "forward",
+        weight: 0.6,
+        description: "inverse form",
+      }];
+
+      const result = validateGraph(graph);
+      expect(result.success).toBe(true);
+      expect(result.data!.edges).toEqual([{
+        source: "node-2",
+        target: "node-1",
+        type: canonical,
+        direction: "forward",
+        weight: 0.6,
+        description: "inverse form",
+      }]);
+    });
+
+    it("matches the alias case-insensitively", () => {
+      const graph = twoNodeGraph();
+      graph.edges = [{
+        source: "node-1", target: "node-2", type: "Documented_By" as any,
+        direction: "forward", weight: 0.5,
+      }];
+      const result = validateGraph(graph);
+      expect(result.data!.edges[0]).toMatchObject({
+        source: "node-2", target: "node-1", type: "documents",
+      });
+    });
+
+    it("leaves same-direction aliases and canonical types untouched", () => {
+      const graph = twoNodeGraph();
+      graph.edges = [
+        { source: "node-2", target: "node-1", type: "describes" as any, direction: "forward", weight: 0.5 },
+        { source: "node-2", target: "node-1", type: "documents", direction: "forward", weight: 0.5 },
+      ];
+      const result = validateGraph(graph);
+      expect(result.data!.edges.map((e) => [e.source, e.target, e.type])).toEqual([
+        ["node-2", "node-1", "documents"],
+        ["node-2", "node-1", "documents"],
+      ]);
+    });
+
+    it("keeps the inverse table disjoint from the plain alias table and chain-free", () => {
+      for (const [alias, target] of Object.entries(INVERSE_EDGE_TYPE_ALIASES)) {
+        expect(EDGE_TYPE_ALIASES).not.toHaveProperty(alias);
+        expect(EDGE_TYPE_ALIASES).not.toHaveProperty(target);
+        expect(INVERSE_EDGE_TYPE_ALIASES).not.toHaveProperty(target);
+      }
+    });
   });
 
   it("accepts node with bare string ID (schema is lenient on format)", () => {
