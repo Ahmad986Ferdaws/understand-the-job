@@ -2,9 +2,11 @@ import { useState } from "react";
 
 interface TokenGateProps {
   onTokenValid: (token: string) => void;
+  /** Shown above the form, e.g. when a stored token was rejected. */
+  notice?: string | null;
 }
 
-export default function TokenGate({ onTokenValid }: TokenGateProps) {
+export default function TokenGate({ onTokenValid, notice }: TokenGateProps) {
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -21,7 +23,7 @@ export default function TokenGate({ onTokenValid }: TokenGateProps) {
       const res = await fetch(`/knowledge-graph.json?token=${encodeURIComponent(token)}`);
       if (res.ok) {
         onTokenValid(token);
-      } else if (res.status === 403) {
+      } else if (res.status === 401 || res.status === 403) {
         setError("Invalid token. Please check and try again.");
       } else {
         setError(`Unexpected response (${res.status}). Is the dashboard server running?`);
@@ -46,6 +48,10 @@ export default function TokenGate({ onTokenValid }: TokenGateProps) {
           Paste the access token from your terminal. Look for the{" "}
           <span role="img" aria-label="key">&#x1F511;</span> line.
         </p>
+
+        {notice && (
+          <p role="status" className="text-amber-300 text-sm text-center mb-6">{notice}</p>
+        )}
 
         {/* Form */}
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">

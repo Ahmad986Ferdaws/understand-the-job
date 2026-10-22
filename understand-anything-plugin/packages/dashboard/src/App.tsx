@@ -17,6 +17,15 @@ import FileExplorer from "./components/FileExplorer";
 import WarningBanner from "./components/WarningBanner";
 import StalenessBanner from "./components/StalenessBanner";
 import TokenGate from "./components/TokenGate";
+import {
+  AuthFailureError,
+  clearStoredToken,
+  extractTokenFromLocation,
+  isAuthFailure,
+  readStoredToken,
+  storeToken,
+} from "./utils/authToken";
+import { readLocalFlag, writeLocalFlag } from "./utils/localFlags";
 import MobileLayout from "./components/MobileLayout";
 import { useIsMobile } from "./hooks/useIsMobile";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
@@ -42,7 +51,6 @@ const KeyboardShortcutsHelp = lazy(
 const OnboardingOverlay = lazy(() => import("./components/OnboardingOverlay"));
 
 const DEMO_MODE = import.meta.env.VITE_DEMO_MODE === "true";
-const SESSION_TOKEN_KEY = "understand-anything-token";
 const ONBOARDING_DISMISSED_KEY = "ua-onboarding-dismissed-v1";
 type SidebarTab = "info" | "files";
 
@@ -50,7 +58,7 @@ function shouldShowOnboarding(): boolean {
   if (typeof window === "undefined") return false;
   const params = new URLSearchParams(window.location.search);
   if (params.get("onboard") === "force") return true;
-  return window.localStorage.getItem(ONBOARDING_DISMISSED_KEY) !== "1";
+  return !readLocalFlag(ONBOARDING_DISMISSED_KEY);
 }
 
 /** Resolve data file URL — in demo mode, use env var URLs; otherwise use local paths with token. */
@@ -79,43 +87,58 @@ function dataUrl(fileName: string, token: string | null): string {
  */
 function resolveInitialToken(): string | null {
   if (DEMO_MODE) return "__demo__";
-  const params = new URLSearchParams(window.location.search);
-  const urlToken = params.get("token");
+  const { token: urlToken, cleanUrl } = extractTokenFromLocation(window.location);
   if (urlToken) {
-    sessionStorage.setItem(SESSION_TOKEN_KEY, urlToken);
+    storeToken(urlToken);
     // Clean the URL
-    params.delete("token");
-    const cleanSearch = params.toString();
-    const newUrl =
-      window.location.pathname + (cleanSearch ? `?${cleanSearch}` : "") + window.location.hash;
-    window.history.replaceState(null, "", newUrl);
+    window.history.replaceState(null, "", cleanUrl);
     return urlToken;
   }
-  return sessionStorage.getItem(SESSION_TOKEN_KEY);
+  return readStoredToken();
 }
 
 function App() {
   const [accessToken, setAccessToken] = useState<string | null>(resolveInitialToken);
+  const [tokenNotice, setTokenNotice] = useState<string | null>(null);
 
   const handleTokenValid = useCallback((token: string) => {
-    sessionStorage.setItem(SESSION_TOKEN_KEY, token);
+    storeToken(token);
+    setTokenNotice(null);
     setAccessToken(token);
+  }, []);
+
+  // The server rejected the token (restarted with a new one, or a stale
+  // sessionStorage entry): forget it and go back to the token gate instead of
+  // sitting on a permanent "Forbidden".
+  const handleAuthFailure = useCallback(() => {
+    clearStoredToken();
+    setTokenNotice(
+      "The access token was rejected, possibly because the dashboard server was restarted. " +
+        "Paste the current token from your terminal.",
+    );
+    setAccessToken(null);
   }, []);
 
   // In demo mode, skip token gate entirely
   if (DEMO_MODE) {
-    return <Dashboard accessToken="__demo__" />;
+    return <Dashboard accessToken="__demo__" onAuthFailure={handleAuthFailure} />;
   }
 
   // Show the token gate when no token is available
   if (accessToken === null) {
-    return <TokenGate onTokenValid={handleTokenValid} />;
+    return <TokenGate onTokenValid={handleTokenValid} notice={tokenNotice} />;
   }
 
-  return <Dashboard accessToken={accessToken} />;
+  return <Dashboard accessToken={accessToken} onAuthFailure={handleAuthFailure} />;
 }
 
-function Dashboard({ accessToken }: { accessToken: string }) {
+function Dashboard({
+  accessToken,
+  onAuthFailure,
+}: {
+  accessToken: string;
+  onAuthFailure: () => void;
+}) {
   const setGraph = useDashboardStore((s) => s.setGraph);
   const setDomainGraph = useDashboardStore((s) => s.setDomainGraph);
   const setDiffOverlay = useDashboardStore((s) => s.setDiffOverlay);
@@ -159,6 +182,7 @@ function Dashboard({ accessToken }: { accessToken: string }) {
           } catch {
             /* non-JSON error body; keep the status code */
           }
+          if (isAuthFailure(res.status, detail)) throw new AuthFailureError();
           throw new Error(detail);
         }
         return res.json();
@@ -188,10 +212,14 @@ function Dashboard({ accessToken }: { accessToken: string }) {
         }
       })
       .catch((err) => {
+        if (err instanceof AuthFailureError) {
+          onAuthFailure();
+          return;
+        }
         console.error("Failed to load knowledge graph:", err);
         setLoadError(`Failed to load knowledge graph: ${err instanceof Error ? err.message : String(err)}`);
       });
-  }, [setGraph]);
+  }, [setGraph, onAuthFailure]);
 
   useEffect(() => {
     if (
@@ -303,7 +331,7 @@ function DashboardContent({
   const [showOnboarding, setShowOnboarding] = useState(shouldShowOnboarding);
   const dismissOnboarding = useCallback((remember: boolean) => {
     if (remember && typeof window !== "undefined") {
-      window.localStorage.setItem(ONBOARDING_DISMISSED_KEY, "1");
+      writeLocalFlag(ONBOARDING_DISMISSED_KEY);
     }
     setShowOnboarding(false);
   }, []);

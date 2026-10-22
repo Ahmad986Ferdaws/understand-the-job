@@ -13,7 +13,7 @@ function buildCopyText(issues: GraphIssue[]): string {
   const lines = hasFatal
     ? [
         "Some of these issues look like dashboard rendering bugs.",
-        "Please file an issue at github.com/Egonex-AI/Understand-Anything/issues with the text below.",
+        "Please file an issue at github.com/Ahmad986Ferdaws/understand-the-job/issues with the text below.",
         "",
       ]
     : [

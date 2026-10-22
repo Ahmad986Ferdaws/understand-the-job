@@ -1,5 +1,7 @@
 import { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
+import MarkdownImage from "./MarkdownImage";
+import { markdownUrlTransform } from "../utils/markdownSafety";
 import { useDashboardStore } from "../store";
 import { useI18n } from "../contexts/I18nContext";
 
@@ -119,7 +121,14 @@ export default function LearnPanel() {
         {/* Description via ReactMarkdown */}
         <div className="text-sm text-text-secondary leading-relaxed mb-4 tour-markdown">
           <ReactMarkdown
+            urlTransform={markdownUrlTransform}
             components={{
+              img: ({ src, alt }) => <MarkdownImage src={src} alt={alt} />,
+              a: ({ children, href }) => (
+                <a href={href} target="_blank" rel="noopener noreferrer" className="text-accent hover:underline">
+                  {children}
+                </a>
+              ),
               p: ({ children }) => (
                 <p className="mb-1.5 last:mb-0">{children}</p>
               ),

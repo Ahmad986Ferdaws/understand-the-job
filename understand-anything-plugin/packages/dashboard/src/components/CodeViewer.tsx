@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Highlight, themes } from "prism-react-renderer";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import MarkdownImage from "./MarkdownImage";
+import { markdownUrlTransform } from "../utils/markdownSafety";
 import { useDashboardStore } from "../store";
 import { useI18n } from "../contexts/I18nContext";
 
@@ -64,6 +66,7 @@ function MarkdownView({ content }: { content: string }) {
     <div className="px-6 py-5 max-w-3xl text-sm text-text-secondary leading-relaxed">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        urlTransform={markdownUrlTransform}
         components={{
           h1: ({ children }) => <h1 className="text-xl font-heading text-text-primary mt-6 mb-3 first:mt-0">{children}</h1>,
           h2: ({ children }) => <h2 className="text-lg font-heading text-text-primary mt-5 mb-2 first:mt-0 border-b border-border-subtle pb-1">{children}</h2>,
@@ -73,7 +76,7 @@ function MarkdownView({ content }: { content: string }) {
           h6: ({ children }) => <h6 className="text-xs font-heading text-text-primary mt-3 mb-1.5 first:mt-0 uppercase tracking-wider">{children}</h6>,
           p: ({ children }) => <p className="mb-3 last:mb-0">{children}</p>,
           a: ({ children, href }) => (
-            <a href={href} target="_blank" rel="noreferrer" className="text-accent hover:underline">
+            <a href={href} target="_blank" rel="noopener noreferrer" className="text-accent hover:underline">
               {children}
             </a>
           ),
@@ -107,9 +110,7 @@ function MarkdownView({ content }: { content: string }) {
             </th>
           ),
           td: ({ children }) => <td className="border border-border-subtle px-2.5 py-1.5">{children}</td>,
-          img: ({ src, alt }) => (
-            <img src={src} alt={alt} className="max-w-full rounded-lg border border-border-subtle my-2" />
-          ),
+          img: ({ src, alt }) => <MarkdownImage src={src} alt={alt} />,
         }}
       >
         {content}

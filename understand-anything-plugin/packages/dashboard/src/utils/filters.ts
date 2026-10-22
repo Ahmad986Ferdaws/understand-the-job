@@ -1,4 +1,4 @@
-import type { GraphNode, GraphEdge } from "@understand-anything/core/types";
+import type { GraphNode, GraphEdge, Layer } from "@understand-anything/core/types";
 import type { FilterState, NodeType, Complexity, EdgeCategory } from "../store";
 import { EDGE_CATEGORY_MAP } from "../store";
 
@@ -73,6 +73,61 @@ export function filterEdges(
 
     return true;
   });
+}
+
+/**
+ * Extend the layer index so each child node (e.g. a function or class inside
+ * a file) counts as a member of its parent's layers. Layers usually list only
+ * file nodes; without this a layer filter would hide every sub-file node.
+ * `parentByChild` maps child node id -> parent node id. Returns the input map
+ * untouched when there is nothing to inherit.
+ */
+export function withInheritedLayerMembership(
+  nodeIdToLayerIds: Map<string, Set<string>>,
+  parentByChild: Map<string, string>,
+): Map<string, Set<string>> {
+  if (parentByChild.size === 0) return nodeIdToLayerIds;
+  const merged = new Map(nodeIdToLayerIds);
+  for (const [childId, parentId] of parentByChild) {
+    if (merged.has(childId)) continue;
+    const parentLayers = nodeIdToLayerIds.get(parentId);
+    if (parentLayers) merged.set(childId, parentLayers);
+  }
+  return merged;
+}
+
+/**
+ * Apply the filter-panel state to the nodes and edges a graph view is about
+ * to render: node type, complexity and layer on nodes, then edge category on
+ * the edges between the surviving nodes. This is what the structural view
+ * calls so the panel's checkboxes actually change the canvas.
+ *
+ * `parentByChild` (optional) lets sub-file nodes inherit their parent's
+ * layers for the layer filter.
+ */
+export function applyFilterPanel(
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+  nodeIdToLayerIds: Map<string, Set<string>>,
+  filters: FilterState,
+  parentByChild?: Map<string, string>,
+): { nodes: GraphNode[]; edges: GraphEdge[] } {
+  const membership =
+    parentByChild && filters.layerIds.size > 0
+      ? withInheritedLayerMembership(nodeIdToLayerIds, parentByChild)
+      : nodeIdToLayerIds;
+  const keptNodes = filterNodes(nodes, membership, filters);
+  const keptIds = new Set(keptNodes.map((n) => n.id));
+  return { nodes: keptNodes, edges: filterEdges(edges, keptIds, filters) };
+}
+
+/**
+ * Layers still visible under the filter panel's layer selection (all of them
+ * when none is selected). Used by the layer-overview canvas.
+ */
+export function filterLayers(layers: Layer[], filters: FilterState): Layer[] {
+  if (filters.layerIds.size === 0) return layers;
+  return layers.filter((layer) => filters.layerIds.has(layer.id));
 }
 
 /**

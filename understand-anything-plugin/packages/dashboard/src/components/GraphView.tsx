@@ -53,6 +53,7 @@ import {
 import { deriveContainers } from "../utils/containers";
 import type { DerivedContainer } from "../utils/containers";
 import { computeLayerStats } from "../utils/layerStats";
+import { applyFilterPanel, filterLayers } from "../utils/filters";
 
 const nodeTypes = {
   custom: CustomNode,
@@ -242,6 +243,7 @@ function useOverviewGraph() {
   const nodeIdToLayerId = useDashboardStore((s) => s.nodeIdToLayerId);
   const searchResults = useDashboardStore((s) => s.searchResults);
   const drillIntoLayer = useDashboardStore((s) => s.drillIntoLayer);
+  const filters = useDashboardStore((s) => s.filters);
 
   // Build cluster nodes / flow edges / dims synchronously; only the layout
   // call itself is async, so we memo the structural pieces and run ELK in an
@@ -250,10 +252,13 @@ function useOverviewGraph() {
     if (!graph) {
       return null;
     }
-    const layers = graph.layers ?? [];
-    if (layers.length === 0) {
+    const allLayers = graph.layers ?? [];
+    if (allLayers.length === 0) {
       return null;
     }
+    // The filter panel's layer selection narrows which layers are shown.
+    const layers = filterLayers(allLayers, filters);
+    const visibleLayerIds = new Set(layers.map((l) => l.id));
 
     // Build search match counts per layer using the precomputed
     // nodeIdToLayerId index. Reusing the store-level index avoids an extra
@@ -293,7 +298,9 @@ function useOverviewGraph() {
     });
 
     // Aggregate edges between layers
-    const aggregated = aggregateLayerEdges(graph);
+    const aggregated = aggregateLayerEdges(graph).filter(
+      (agg) => visibleLayerIds.has(agg.sourceLayerId) && visibleLayerIds.has(agg.targetLayerId),
+    );
     const flowEdges: Edge[] = aggregated.map((agg, i) => ({
       id: `le-${i}`,
       source: agg.sourceLayerId,
@@ -312,7 +319,7 @@ function useOverviewGraph() {
     }
 
     return { clusterNodes, flowEdges, dims };
-  }, [graph, nodesById, nodeIdToLayerId, searchResults, drillIntoLayer]);
+  }, [graph, nodesById, nodeIdToLayerId, searchResults, drillIntoLayer, filters]);
 
   const [overview, setOverview] = useState<{ nodes: Node[]; edges: Edge[] }>({
     nodes: [],
@@ -403,6 +410,8 @@ function useLayerDetailTopology(): LayerDetailTopology & {
   const affectedNodeIds = useDashboardStore((s) => s.affectedNodeIds);
   const focusNodeId = useDashboardStore((s) => s.focusNodeId);
   const nodeTypeFilters = useDashboardStore((s) => s.nodeTypeFilters);
+  const filters = useDashboardStore((s) => s.filters);
+  const nodeIdToLayerIds = useDashboardStore((s) => s.nodeIdToLayerIds);
   const drillIntoLayer = useDashboardStore((s) => s.drillIntoLayer);
   const detailLevel = useDashboardStore((s) => s.detailLevel);
   const showFunctionsInClassView = useDashboardStore((s) => s.showFunctionsInClassView);
@@ -438,6 +447,9 @@ function useLayerDetailTopology(): LayerDetailTopology & {
     // File view: file nodes only (architecture-level dependencies).
     // Class view: file nodes + class nodes, functions only when toggle is on.
     const expandedLayerNodeIds = new Set(layerNodeIds);
+    // child -> parent file, so the filter panel's layer filter can treat
+    // sub-file nodes as members of their file's layers.
+    const parentByChild = new Map<string, string>();
     if (detailLevel !== "file") {
       for (const edge of graph.edges) {
         if (edge.type === "contains" && layerNodeIds.has(edge.source)) {
@@ -445,8 +457,10 @@ function useLayerDetailTopology(): LayerDetailTopology & {
           if (!child) continue;
           if (child.type === "class") {
             expandedLayerNodeIds.add(edge.target);
+            parentByChild.set(edge.target, edge.source);
           } else if (child.type === "function" && showFunctionsInClassView) {
             expandedLayerNodeIds.add(edge.target);
+            parentByChild.set(edge.target, edge.source);
           }
         }
       }
@@ -473,11 +487,18 @@ function useLayerDetailTopology(): LayerDetailTopology & {
       return nodeTypeFilters[effectiveCategory] !== false;
     });
 
-    let filteredNodeIds = new Set(filteredGraphNodes.map((n) => n.id));
-
-    let filteredGraphEdges = graph.edges.filter(
-      (e) => filteredNodeIds.has(e.source) && filteredNodeIds.has(e.target),
+    // Filter panel (node type, complexity, layer, edge category). Also
+    // reduces the edges to those between the surviving nodes.
+    const panel = applyFilterPanel(
+      filteredGraphNodes,
+      graph.edges,
+      nodeIdToLayerIds,
+      filters,
+      parentByChild,
     );
+    filteredGraphNodes = panel.nodes;
+    let filteredNodeIds = new Set(filteredGraphNodes.map((n) => n.id));
+    let filteredGraphEdges = panel.edges;
 
     // Focus mode: 1-hop neighborhood within the layer
     if (focusNodeId && filteredNodeIds.has(focusNodeId)) {
@@ -669,6 +690,8 @@ function useLayerDetailTopology(): LayerDetailTopology & {
     affectedNodeIds,
     focusNodeId,
     nodeTypeFilters,
+    filters,
+    nodeIdToLayerIds,
     drillIntoLayer,
     detailLevel,
     showFunctionsInClassView,

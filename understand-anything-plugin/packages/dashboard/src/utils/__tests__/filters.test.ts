@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { filterNodes, filterEdges } from "../filters";
+import {
+  filterNodes,
+  filterEdges,
+  applyFilterPanel,
+  filterLayers,
+  withInheritedLayerMembership,
+} from "../filters";
 import type {
   GraphNode,
   GraphEdge,
@@ -192,5 +198,132 @@ describe("filterEdges", () => {
     const visible = new Set(["a", "b"]);
     const out = filterEdges(edges, visible, defaultFilters());
     expect(out).toHaveLength(1);
+  });
+});
+
+// These are the pure functions GraphView calls so the Filter panel's
+// checkboxes change the canvas (the panel used to write `filters` that only
+// the export menu read).
+describe("applyFilterPanel (what the structural view applies)", () => {
+  const nodes = [
+    node("file-simple", "file", "simple"),
+    node("file-complex", "file", "complex"),
+    node("cfg", "config", "simple"),
+    node("cls", "class", "moderate"),
+  ];
+  const edges = [
+    edge("file-simple", "file-complex", "imports"),   // structural
+    edge("file-simple", "cfg", "configures"),         // dependencies
+    edge("file-complex", "cls", "contains"),          // structural
+    edge("cls", "file-simple", "calls"),              // behavioral
+  ];
+
+  it("is a no-op with the default (everything on) filters", () => {
+    const out = applyFilterPanel(nodes, edges, new Map(), defaultFilters());
+    expect(out.nodes).toHaveLength(4);
+    expect(out.edges).toHaveLength(4);
+  });
+
+  it("hides unchecked node types and the edges that touched them", () => {
+    const filters = defaultFilters({
+      nodeTypes: new Set<NodeType>(ALL_NODE_TYPES.filter((t) => t !== "config")),
+    });
+    const out = applyFilterPanel(nodes, edges, new Map(), filters);
+    expect(out.nodes.map((n) => n.id)).toEqual(["file-simple", "file-complex", "cls"]);
+    expect(out.edges.map((e) => e.target)).not.toContain("cfg");
+    expect(out.edges).toHaveLength(3);
+  });
+
+  it("hides unchecked complexities", () => {
+    const filters = defaultFilters({
+      complexities: new Set<Complexity>(["simple", "moderate"]),
+    });
+    const out = applyFilterPanel(nodes, edges, new Map(), filters);
+    expect(out.nodes.map((n) => n.id)).toEqual(["file-simple", "cfg", "cls"]);
+    // Edges into the hidden node are gone, the rest survive.
+    expect(out.edges.map((e) => `${e.source}>${e.target}`)).toEqual([
+      "file-simple>cfg",
+      "cls>file-simple",
+    ]);
+  });
+
+  it("hides unchecked edge categories but keeps every node", () => {
+    const filters = defaultFilters({
+      edgeCategories: new Set<EdgeCategory>(["structural"]),
+    });
+    const out = applyFilterPanel(nodes, edges, new Map(), filters);
+    expect(out.nodes).toHaveLength(4);
+    expect(out.edges.map((e) => e.type)).toEqual(["imports", "contains"]);
+  });
+
+  it("restricts to the selected layers", () => {
+    const idx = indexLayers([
+      { id: "L1", name: "L1", description: "", nodeIds: ["file-simple", "cfg"] },
+      { id: "L2", name: "L2", description: "", nodeIds: ["file-complex"] },
+    ]);
+    const filters = defaultFilters({ layerIds: new Set(["L1"]) });
+    const out = applyFilterPanel(nodes, edges, idx, filters);
+    expect(out.nodes.map((n) => n.id)).toEqual(["file-simple", "cfg"]);
+    expect(out.edges.map((e) => e.type)).toEqual(["configures"]);
+  });
+
+  it("lets sub-file nodes inherit their parent file's layer", () => {
+    // Layers list files only; a class inside a file in L1 must stay visible
+    // when L1 is the selected layer, and vanish when only L2 is selected.
+    const idx = indexLayers([
+      { id: "L1", name: "L1", description: "", nodeIds: ["file-complex"] },
+      { id: "L2", name: "L2", description: "", nodeIds: ["file-simple"] },
+    ]);
+    const parents = new Map([["cls", "file-complex"]]);
+
+    const l1 = applyFilterPanel(nodes, edges, idx, defaultFilters({ layerIds: new Set(["L1"]) }), parents);
+    expect(l1.nodes.map((n) => n.id).sort()).toEqual(["cls", "file-complex"]);
+
+    const l2 = applyFilterPanel(nodes, edges, idx, defaultFilters({ layerIds: new Set(["L2"]) }), parents);
+    expect(l2.nodes.map((n) => n.id)).toEqual(["file-simple"]);
+
+    // Without the parent map the class would be dropped (the old behaviour).
+    const noParents = applyFilterPanel(nodes, edges, idx, defaultFilters({ layerIds: new Set(["L1"]) }));
+    expect(noParents.nodes.map((n) => n.id)).toEqual(["file-complex"]);
+  });
+
+  it("does not mutate its inputs", () => {
+    const idx = indexLayers([{ id: "L1", name: "L1", description: "", nodeIds: ["file-complex"] }]);
+    const before = new Map(idx);
+    applyFilterPanel(nodes, edges, idx, defaultFilters({ layerIds: new Set(["L1"]) }), new Map([["cls", "file-complex"]]));
+    expect(idx).toEqual(before);
+    expect(nodes).toHaveLength(4);
+    expect(edges).toHaveLength(4);
+  });
+});
+
+describe("withInheritedLayerMembership", () => {
+  it("returns the same map when there is nothing to inherit", () => {
+    const idx = indexLayers([{ id: "L1", name: "L1", description: "", nodeIds: ["a"] }]);
+    expect(withInheritedLayerMembership(idx, new Map())).toBe(idx);
+  });
+
+  it("does not override a child's own layers", () => {
+    const idx = indexLayers([
+      { id: "L1", name: "L1", description: "", nodeIds: ["parent"] },
+      { id: "L2", name: "L2", description: "", nodeIds: ["child"] },
+    ]);
+    const merged = withInheritedLayerMembership(idx, new Map([["child", "parent"]]));
+    expect([...(merged.get("child") ?? [])]).toEqual(["L2"]);
+  });
+});
+
+describe("filterLayers (overview canvas)", () => {
+  const layers: Layer[] = [
+    { id: "L1", name: "L1", description: "", nodeIds: [] },
+    { id: "L2", name: "L2", description: "", nodeIds: [] },
+  ];
+
+  it("shows every layer when none is selected", () => {
+    expect(filterLayers(layers, defaultFilters())).toBe(layers);
+  });
+
+  it("shows only the selected layers", () => {
+    expect(filterLayers(layers, defaultFilters({ layerIds: new Set(["L2"]) })).map((l) => l.id)).toEqual(["L2"]);
   });
 });
