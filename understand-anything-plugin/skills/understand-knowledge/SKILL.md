@@ -27,6 +27,17 @@ Detection signals: has `index.md` + multiple `.md` files with wikilinks. May hav
    - If the user provided a path argument, use that
    - Otherwise, use the current working directory
    - **Resolve the data directory `$UA_DIR`** once, and reuse it for every read and write below: `UA_DIR="<TARGET_DIR>/$([ -d "<TARGET_DIR>/.understand-anything" ] && echo .understand-anything || echo .ua)"` — this selects the legacy `.understand-anything/` when it already exists, otherwise the new `.ua/`.
+   - **Data directory safety check.** Before anything reads or writes the data directory, resolve the plugin root and run the bundled check:
+     ```bash
+     PLUGIN_ROOT=""
+     for candidate in "${CLAUDE_PLUGIN_ROOT}" "$(cd -P "<SKILL_DIR>/../.." 2>/dev/null && pwd -P)" "$HOME/.understand-anything-plugin"; do
+       if [ -n "$candidate" ] && [ -f "$candidate/skills/understand/ensure-safe-data-dir.mjs" ]; then PLUGIN_ROOT="$candidate"; break; fi
+     done
+     if [ -z "$PLUGIN_ROOT" ]; then echo "Error: Cannot find the understand-the-job plugin root."; exit 1; fi
+     node "$PLUGIN_ROOT/skills/understand/ensure-safe-data-dir.mjs" "<TARGET_DIR>"
+     ```
+     If it exits non-zero, show its one-line reason to the user and **STOP**. It rejects a data directory (`.ua/`, or legacy `.understand-anything/`) that is a symlink, contains a symlink, or resolves outside the project.
+   - **Existing graph check.** The code, knowledge, and design graphs share one data directory, so this skill writes the same `$UA_DIR/knowledge-graph.json` that `/understand` writes. If that file exists, read its top-level `kind`. If `kind` is not `"knowledge"` (no `kind` means the code graph from `/understand`), tell the user this run would replace that graph and ask whether to continue. If they decline, **STOP**. Remember a "yes" as `$REPLACE_EXISTING_GRAPH` for Phases 4 and 5.
 
 2. Run the format detection script bundled with this skill:
    ```
@@ -76,6 +87,11 @@ Dispatch `article-analyzer` subagents to extract implicit knowledge:
    ```
    python3 "<SKILL_DIR>/merge-knowledge-graph.py" "<TARGET_DIR>"
    ```
+   `merge-knowledge-graph.py` refuses to overwrite an existing code graph unless `--force` is passed. Add `--force` only when the user said yes in the Phase 1 existing graph check (`$REPLACE_EXISTING_GRAPH`):
+   ```
+   python3 "<SKILL_DIR>/merge-knowledge-graph.py" "<TARGET_DIR>" --force
+   ```
+   If it refuses, relay its message and **STOP** — never add `--force` without the user's yes.
 
 2. The script:
    - Combines scan-manifest.json + all analysis-batch-*.json files
@@ -98,7 +114,7 @@ Dispatch `article-analyzer` subagents to extract implicit knowledge:
    - Every node must have: id, type, name, summary, tags, complexity
    - Remove any edges with dangling references
 
-3. Copy the validated graph to `$UA_DIR/knowledge-graph.json`
+3. Copy the validated graph to `$UA_DIR/knowledge-graph.json` — only when no graph exists there, the existing one has `kind: "knowledge"`, or the user agreed in Phase 1 to replace it
 
 4. Write metadata to `$UA_DIR/meta.json`:
    ```json

@@ -12,8 +12,8 @@ Analyze the current codebase and produce a `knowledge-graph.json` file in the pr
 
 - `$ARGUMENTS` may contain:
   - `--full` — Force a full rebuild, ignoring any existing graph
-  - `--auto-update` — Enable automatic graph updates on commit (writes `autoUpdate: true` to `$UA_DIR/config.json`)
-  - `--no-auto-update` — Disable automatic graph updates (writes `autoUpdate: false` to `$UA_DIR/config.json`)
+  - `--auto-update` — Opt this project in to refresh hints after commits and at session start (adds it to the per-user list `~/.understand-the-job/auto-update.json`; the hints only suggest running `/understand`, they never run it)
+  - `--no-auto-update` — Opt this project out again (removes it from that per-user list)
   - `--review` — Run full LLM graph-reviewer instead of inline deterministic validation
   - `--language <lang>` — Generate all textual content (summaries, descriptions, tags, titles, languageNotes, languageLesson) in the specified language. Accepts ISO 639-1 codes (`zh`, `ja`, `ko`, `en`, `es`, `fr`, `de`, etc.) or friendly names (`chinese`, `japanese`, `korean`, `english`, `spanish`, etc.). Locale variants supported: `zh-TW`, `zh-HK`, etc. Defaults to `en` (English). Stores preference in `$UA_DIR/config.json` for consistency across incremental updates.
   - `--exclude <patterns>` — Comma-separated glob patterns for additional files/directories to exclude from analysis (e.g., `--exclude "tests/*,docs/*"`). These patterns take highest priority over built-in defaults and `.understandignore` rules. Supports gitignore syntax including `!` negation.
@@ -71,6 +71,11 @@ Determine whether to run a full analysis or incremental update.
      ```
 
      Set `UNDERSTAND_NO_WORKTREE_REDIRECT=1` if you intentionally want a per-worktree graph (rare — most users want the redirect).
+1.2. **Data directory safety check.** Before anything reads or writes the data directory, run the bundled check (located next to this SKILL.md file):
+   ```bash
+   node "<SKILL_DIR>/ensure-safe-data-dir.mjs" "$PROJECT_ROOT"
+   ```
+   If it exits non-zero, show its one-line reason to the user and **STOP**. It rejects a data directory (`.ua/`, or legacy `.understand-anything/`) that is a symlink, contains a symlink, or resolves outside the project — any of which would let later phases read or overwrite files elsewhere on disk.
 1.5. **Ensure the plugin is built.** Later phases invoke Node scripts that import `@understand-anything/core`. On a fresh install `packages/core/dist/` does not exist yet — build once.
 
    **Important:** do **not** assume the plugin root is simply two directories above the skill path string. In many installations `~/.agents/skills/understand` is a symlink into the real plugin checkout. Prefer runtime-provided plugin roots first (for Claude), then fall back to universal symlinks, skill symlink resolution, and common clone-based install paths.
@@ -115,11 +120,11 @@ Determine whether to run a full analysis or incremental update.
    fi
 
    if [ ! -f "$PLUGIN_ROOT/packages/core/dist/index.js" ]; then
-     cd "$PLUGIN_ROOT" && (pnpm install --frozen-lockfile 2>/dev/null || pnpm install) && pnpm --filter @understand-anything/core build
+     cd "$PLUGIN_ROOT" && pnpm install --frozen-lockfile && pnpm --filter @understand-anything/core build
    fi
    ```
 
-   If `pnpm` is missing, report to the user: "Install Node.js ≥ 22 and pnpm ≥ 10, then re-run `/understand`."
+   If `pnpm` is missing, report to the user: "Install Node.js ≥ 22 and pnpm ≥ 10, then re-run `/understand`." If `pnpm install --frozen-lockfile` fails, relay the error and **STOP** — never fall back to an install without `--frozen-lockfile`, which could pull dependency versions nobody reviewed.
 
 1.7. **Resolve the data directory `$UA_DIR`.** All Understand-Anything artifacts live in the project's data directory. Resolve it once, now that `$PROJECT_ROOT` is known, and reuse `$UA_DIR` for every read and write in later phases:
    ```bash
@@ -140,10 +145,18 @@ Determine whether to run a full analysis or incremental update.
    ```bash
    find "$UA_DIR/" -maxdepth 1 -type d -name '.trash-*' -mtime +7 -exec rm -rf {} + 2>/dev/null || true
    ```
-3.5. **Auto-update configuration:**
-    - If `--auto-update` is in `$ARGUMENTS`: write `{"autoUpdate": true}` to `$UA_DIR/config.json`
-    - If `--no-auto-update` is in `$ARGUMENTS`: write `{"autoUpdate": false}` to `$UA_DIR/config.json`
-    - These flags only set the config — analysis proceeds normally regardless.
+3.5. **Auto-update opt-in (per user, never per repo):**
+    - If `--auto-update` is in `$ARGUMENTS`, add this project to the user's opt-in list, which lives outside every repository at `~/.understand-the-job/auto-update.json`:
+      ```bash
+      node "<SKILL_DIR>/auto-update-optin.mjs" add "$PROJECT_ROOT"
+      ```
+    - If `--no-auto-update` is in `$ARGUMENTS`, remove it:
+      ```bash
+      node "<SKILL_DIR>/auto-update-optin.mjs" remove "$PROJECT_ROOT"
+      ```
+    - Relay the script's one-line result. For an opted-in project the plugin hooks only *suggest* a refresh after commits and at session start; they never run `/understand` themselves, and you still ask the user before refreshing.
+    - Never read or write an `autoUpdate` field in `$UA_DIR/config.json`. It is ignored, so a cloned repository cannot turn auto-update on for itself.
+    - These flags only change the opt-in list — analysis proceeds normally regardless.
 
  3.6. **Language configuration:**
     - Parse `$ARGUMENTS` for `--language <lang>` flag. If found, extract the language code.
@@ -173,7 +186,7 @@ Determine whether to run a full analysis or incremental update.
 4. **Check for subdomain knowledge graphs to merge:**
    List all `*knowledge-graph*.json` files in `$UA_DIR/` **excluding** `knowledge-graph.json` itself (e.g. `frontend-knowledge-graph.json`, `backend-knowledge-graph.json`). If any subdomain graphs exist, run the merge script bundled with this skill (located next to this SKILL.md file — use the skill directory path, not the project root):
    ```bash
-   python "<SKILL_DIR>/merge-subdomain-graphs.py" "$PROJECT_ROOT"
+   python3 "<SKILL_DIR>/merge-subdomain-graphs.py" "$PROJECT_ROOT"
    ```
    The script discovers subdomain graphs, loads the existing `knowledge-graph.json` as a base (if present), and merges everything into `knowledge-graph.json` (deduplicating nodes and edges). Report the merge summary to the user, then continue with the merged graph.
 
@@ -260,7 +273,36 @@ Set up and verify the `.understandignore` file before a full scan. Incremental p
 
 Report to the user: `[Phase 1/7] Scanning project files...`
 
-Dispatch a subagent using the `project-scanner` agent definition (at `agents/project-scanner.md`). Append the following additional context:
+**Step 1 — Run the deterministic scanners (main session).** The project-scanner agent reads untrusted project files and has no shell, so the bundled scripts (located next to this SKILL.md file) run here. Pass `--exclude "$EXCLUDE_PATTERNS"` only when the option is non-empty:
+
+```bash
+node "<SKILL_DIR>/scan-project.mjs" "$PROJECT_ROOT" "$UA_DIR/tmp/ua-scan-files.json"
+```
+
+With explicit exclusions:
+
+```bash
+node "<SKILL_DIR>/scan-project.mjs" "$PROJECT_ROOT" "$UA_DIR/tmp/ua-scan-files.json" --exclude "$EXCLUDE_PATTERNS"
+```
+
+Then derive the import-map input from the scan output (the `files[]` array passes through verbatim), print the scan summary, and resolve imports:
+
+```bash
+node - "$PROJECT_ROOT" "$UA_DIR/tmp/ua-scan-files.json" "$UA_DIR/tmp/ua-import-map-input.json" <<'NODE'
+const fs = require('fs');
+const [projectRoot, scanPath, outPath] = process.argv.slice(2);
+const scan = JSON.parse(fs.readFileSync(scanPath, 'utf8'));
+const files = scan.files.map(({ path, language, fileCategory }) => ({ path, language, fileCategory }));
+fs.writeFileSync(outPath, JSON.stringify({ projectRoot, files }, null, 2));
+const { totalFiles, filteredByIgnore, estimatedComplexity, stats } = scan;
+console.log(JSON.stringify({ totalFiles, filteredByIgnore, estimatedComplexity, stats }));
+NODE
+node "<SKILL_DIR>/extract-import-map.mjs" "$UA_DIR/tmp/ua-import-map-input.json" "$UA_DIR/tmp/ua-import-map-output.json"
+```
+
+Store the JSON line printed by the middle command as `$SCAN_SUMMARY`. Capture stderr from both bundled scripts and append every line starting with `Warning:` to `$PHASE_WARNINGS`. If either script exits non-zero, re-run it (up to 2 retries); if it still fails, relay its stderr as a Phase 1 failure and **STOP** — there is no hand-written substitute scanner.
+
+**Step 2 — Narrative fields (project-scanner agent).** Dispatch a subagent using the `project-scanner` agent definition (at `agents/project-scanner.md`). Append the following additional context:
 
 > **Additional context from main session:**
 >
@@ -280,13 +322,47 @@ Dispatch a subagent using the `project-scanner` agent definition (at `agents/pro
 
 Pass these parameters in the dispatch prompt:
 
-> Scan this project directory to discover all project files (including non-code files like configs, docs, infrastructure), detect languages and frameworks.
+> The bundled scanners already ran. Read the project's README and manifests and write the narrative fields (`name`, `description`, `languages`, `frameworks`).
 > Project root: `$PROJECT_ROOT`
-> Write output to: `$UA_DIR/intermediate/scan-result.json`
->
-> Exclude patterns (from --exclude CLI flag; pass to scan-project.mjs via --exclude): $EXCLUDE_PATTERNS
+> Scan file list (Grep it; do not read it whole): `$UA_DIR/tmp/ua-scan-files.json`
+> Scan summary: `$SCAN_SUMMARY`
+> Write output to: `$UA_DIR/tmp/ua-scan-narrative.json`
 
-After the subagent completes, read `$UA_DIR/intermediate/scan-result.json` to get:
+**Step 3 — Assemble `scan-result.json` (main session).** Merge the agent's narrative with the scripts' output deterministically, so the file list and import map are copied verbatim and never pass through an LLM:
+
+```bash
+node - "$PROJECT_ROOT" "$UA_DIR/tmp/ua-scan-files.json" "$UA_DIR/tmp/ua-import-map-output.json" "$UA_DIR/tmp/ua-scan-narrative.json" "$UA_DIR/intermediate/scan-result.json" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const [projectRoot, scanPath, importPath, narrativePath, outPath] = process.argv.slice(2);
+const read = p => JSON.parse(fs.readFileSync(p, 'utf8'));
+const scan = read(scanPath);
+const { importMap } = read(importPath);
+let narrative = {};
+try { narrative = read(narrativePath); } catch (err) { console.error(`Warning: project-scanner narrative unreadable (${err.message}); using defaults`); }
+const text = v => (typeof v === 'string' && v.trim() ? v.trim() : null);
+const list = v => (Array.isArray(v) ? [...new Set(v.filter(x => typeof x === 'string' && x.trim()))] : []);
+const languages = list(narrative.languages);
+const result = {
+  name: text(narrative.name) ?? path.basename(projectRoot),
+  description: text(narrative.description) ?? 'No description available',
+  languages: (languages.length ? languages : Object.keys(scan.stats?.byLanguage ?? {})).sort(),
+  frameworks: list(narrative.frameworks),
+  files: scan.files,
+  totalFiles: scan.totalFiles,
+  filteredByIgnore: scan.filteredByIgnore,
+  estimatedComplexity: scan.estimatedComplexity,
+  contentDigest: scan.contentDigest,
+  importMap: importMap ?? {},
+};
+fs.writeFileSync(outPath, JSON.stringify(result, null, 2));
+console.log(`scan-result: ${result.totalFiles} files, ${Object.keys(result.importMap).length} import-map entries`);
+NODE
+```
+
+Append any `Warning:` line from this step to `$PHASE_WARNINGS`. A failed project-scanner dispatch (after the usual single retry) is not fatal: this step still writes a valid inventory with default narrative fields.
+
+Then read `$UA_DIR/intermediate/scan-result.json` to get:
 - Project name, description
 - Languages, frameworks
 - File list with line counts and `fileCategory` per file (`code`, `config`, `docs`, `infra`, `data`, `script`, `markup`)
@@ -338,6 +414,39 @@ Load `$UA_DIR/intermediate/batches.json` (produced by Phase 1.5). Iterate the `b
 
 Report: `[Phase 2/7] Analyzing files — <totalFiles> files in <totalBatches> batches (up to 5 concurrent)...`
 
+#### Structural extraction (main session, before any dispatch)
+
+file-analyzer agents read untrusted source files and have no shell, so the main session runs the bundled structural extractor (`extract-structure.mjs`, located next to this SKILL.md file) for every batch first. Set `$BATCHES_FILE` to `$UA_DIR/intermediate/batches.json` for normal and incremental dispatch, and to `$UA_DIR/intermediate/incremental-symbol-retry.json` for the one symbol-repair dispatch:
+
+```bash
+node - "<SKILL_DIR>" "$PROJECT_ROOT" "$BATCHES_FILE" "$UA_DIR/tmp" <<'NODE'
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const [skillDir, projectRoot, batchesPath, tmpDir] = process.argv.slice(2);
+const failed = [];
+for (const batch of JSON.parse(fs.readFileSync(batchesPath, 'utf8')).batches) {
+  const id = batch.batchIndex;
+  const input = path.join(tmpDir, `ua-file-analyzer-input-${id}.json`);
+  const output = path.join(tmpDir, `ua-file-extract-results-${id}.json`);
+  const batchFiles = batch.files.map(({ path: p, language, sizeLines, fileCategory }) => ({ path: p, language, sizeLines, fileCategory }));
+  fs.writeFileSync(input, JSON.stringify({ projectRoot, batchFiles, batchImportData: batch.batchImportData ?? {} }, null, 2));
+  fs.rmSync(output, { force: true });
+  let ok = true;
+  try {
+    execFileSync(process.execPath, [path.join(skillDir, 'extract-structure.mjs'), input, output], { stdio: ['ignore', 'inherit', 'inherit'] });
+  } catch { ok = false; }
+  if (ok && fs.existsSync(output) && fs.statSync(output).size > 0) console.log(`batch ${id}: ${output}`);
+  else failed.push(id);
+}
+if (failed.length) { console.error(`Structural extraction failed for batch(es): ${failed.join(', ')}`); process.exit(1); }
+NODE
+```
+
+A batch fails when the extractor exits non-zero (for example when no file in the batch could be read) or exits 0 without writing a non-empty output file (a silent no-op); the command checks both. If it exits non-zero, re-run it once (it is idempotent). If batches still fail: in a full analysis, record each failed batch (with the extractor's stderr) in `$PHASE_WARNINGS` and do not dispatch it; in an incremental update or the symbol repair, **STOP** without merging or finalizing. Never write a substitute extraction script.
+
+#### Dispatch
+
 For each batch, dispatch a subagent using the `file-analyzer` agent definition (at `agents/file-analyzer.md`). Run up to **5 subagents concurrently**. Append the following additional context:
 
 > **Additional context from main session:**
@@ -354,7 +463,7 @@ Dispatch prompt template (fill in batch-specific values from `batches.json[i]`):
 > Project: `<projectName>`
 > Languages: `<languages>`
 > Batch: `<batchIndex>/<totalBatches>`
-> Skill directory (for bundled scripts): `<SKILL_DIR>`
+> Structural extraction results (already produced by the main session — read them, do not regenerate them): `$UA_DIR/tmp/ua-file-extract-results-<batchIndex>.json`
 > Output: write to `$UA_DIR/intermediate/batch-<batchIndex>.json` (single-file mode) OR `batch-<batchIndex>-part-<k>.json` (split mode, per Step B of your output protocol).
 >
 > Pre-resolved import data for this batch (use directly — do NOT re-resolve imports from source):
@@ -372,13 +481,13 @@ Dispatch prompt template (fill in batch-specific values from `batches.json[i]`):
 > 2. `<path>` (<sizeLines> lines, language: `<language>`, fileCategory: `<fileCategory>`)
 > ...
 
-**Output naming is per-batchIndex — no fusion.** If you fuse multiple small batches into a single file-analyzer dispatch for token efficiency, the dispatched agent must STILL write one output file per original `batchIndex` using `batch-<batchIndex>.json` or `batch-<batchIndex>-part-<k>.json`. The merge script's regex (`batch-(\d+)(?:-part-(\d+))?\.json`) silently drops any other naming (e.g., `batch-fused-8-13.json`, `batch-8-13.json`), losing every node and edge in that file. After each dispatch returns, verify each `batchIndex` in the dispatched input has a corresponding `batch-<batchIndex>.json` (or `batch-<batchIndex>-part-*.json`) on disk before proceeding to the next dispatch.
+**Output naming is per-batchIndex — no fusion.** If you fuse multiple small batches into a single file-analyzer dispatch for token efficiency, list every fused batch's `ua-file-extract-results-<batchIndex>.json` path in the prompt; the dispatched agent must STILL write one output file per original `batchIndex` using `batch-<batchIndex>.json` or `batch-<batchIndex>-part-<k>.json`. The merge script's regex (`batch-(\d+)(?:-part-(\d+))?\.json`) silently drops any other naming (e.g., `batch-fused-8-13.json`, `batch-8-13.json`), losing every node and edge in that file. After each dispatch returns, verify each `batchIndex` in the dispatched input has a corresponding `batch-<batchIndex>.json` (or `batch-<batchIndex>-part-*.json`) on disk before proceeding to the next dispatch.
 
 After ALL batches complete, report to the user: `Phase 2 complete. All <totalBatches> batches analyzed.`
 
 Run the merge-and-normalize script bundled with this skill (located next to this SKILL.md file — use the skill directory path, not the project root):
 ```bash
-python "<SKILL_DIR>/merge-batch-graphs.py" "$PROJECT_ROOT"
+python3 "<SKILL_DIR>/merge-batch-graphs.py" "$PROJECT_ROOT"
 ```
 
 This script reads all `batch-*.json` files (including `batch-<i>-part-<k>.json` produced by file-analyzers that split their output) from `$UA_DIR/intermediate/`, then in one pass:
@@ -400,12 +509,12 @@ Include the script's warnings in `$PHASE_WARNINGS` for the reviewer.
 
 `prepare-incremental.mjs` has already refreshed the complete file inventory and `importMap`, written the exact analyzer list, and pruned changed/deleted paths from the old graph into `batch-existing.json`.
 
-1. If `filesToReanalyze` is non-empty, dispatch file-analyzer only for the batches from the incremental `batches.json`, using the same prompt template as the full path. Include `previousSymbols`: the function/class/method node checklist for those files from `incremental-symbol-baseline.json` (IDs, names, types, paths, line ranges, and class containment). Existing symbols that still exist must survive significance filtering; regenerate their semantics from current source. Never add `deletedFiles`, `cosmeticFiles`, `ignoredFiles`, or `generatedArtifactFiles` to a prompt.
+1. If `filesToReanalyze` is non-empty, run the structural extraction step above on the incremental `batches.json`, then dispatch file-analyzer only for those batches, using the same prompt template as the full path. Include `previousSymbols`: the function/class/method node checklist for those files from `incremental-symbol-baseline.json` (IDs, names, types, paths, line ranges, and class containment). Existing symbols that still exist must survive significance filtering; regenerate their semantics from current source. Never add `deletedFiles`, `cosmeticFiles`, `ignoredFiles`, or `generatedArtifactFiles` to a prompt.
 2. If `filesToReanalyze` is empty, dispatch no agent and create no new batch file.
 3. Run the merge script in both cases:
 
    ```bash
-   python "<SKILL_DIR>/merge-batch-graphs.py" "$PROJECT_ROOT"
+   python3 "<SKILL_DIR>/merge-batch-graphs.py" "$PROJECT_ROOT"
    ```
 
 The merge combines `batch-existing.json` with any fresh batch output. Its import recovery reads the already-refreshed `scan-result.json`, so added and removed imports are reflected during this same run. Require a successful exit as well as `assembled-graph.json` before continuing. A failed merge can deliberately leave an incomplete candidate for diagnosis.
@@ -430,7 +539,7 @@ When the report has `unresolvedFiles`, prepare exactly one repair:
 node "<SKILL_DIR>/prepare-symbol-retry.mjs" "$PROJECT_ROOT"
 ```
 
-This helper revalidates the candidate, records attempt 1/1 for the base/head commits, removes the affected files' new nodes and outgoing edges, clears old numeric batch shards, and preserves other merged results in `batch-0.json`. Current inbound edges from other files remain candidates until merge reconciles their targets against the replacement nodes; candidates with missing targets are dropped. Dispatch only `batches[]` from `incremental-symbol-retry.json`, using each batch's `files`, `batchIndex`, `batchImportData`, `neighborMap`, `previousSymbols`, and `missingSymbols`. Use the normal file-analyzer prompt and output names. The repair must reanalyze each affected file completely, not just append missing nodes. Then rerun merge. Do not rerun prepare to obtain another retry; the attempt remains used for those commits.
+This helper revalidates the candidate, records attempt 1/1 for the base/head commits, removes the affected files' new nodes and outgoing edges, clears old numeric batch shards, and preserves other merged results in `batch-0.json`. Current inbound edges from other files remain candidates until merge reconciles their targets against the replacement nodes; candidates with missing targets are dropped. Run the structural extraction step with `$BATCHES_FILE` set to `$UA_DIR/intermediate/incremental-symbol-retry.json`, then dispatch only `batches[]` from `incremental-symbol-retry.json`, using each batch's `files`, `batchIndex`, `batchImportData`, `neighborMap`, `previousSymbols`, and `missingSymbols`. Use the normal file-analyzer prompt and output names. The repair must reanalyze each affected file completely, not just append missing nodes. Then rerun merge. Do not rerun prepare to obtain another retry; the attempt remains used for those commits.
 
 If repair preparation, the repair dispatch, or the second merge fails, **STOP** and retain diagnostics. Do not publish or advance `knowledge-graph.json`, `fingerprints.json`, or `meta.json`. Never concatenate old nodes or old semantic edges into the candidate to satisfy the gate. Other merge failures without eligible unresolved files stop immediately. On success, continue to the applicable architecture/tour phases.
 

@@ -36,29 +36,16 @@ Start the Understand Anything dashboard to visualize the knowledge graph for the
    fi
    ```
 
-2. Check that `$UA_DIR/knowledge-graph.json` exists in the project directory. If not, tell the user:
-   ```
-   No knowledge graph found. Run /understand first to analyze this project.
-   ```
-
-   Use the Bash tool to check:
-   ```bash
-   if [ ! -f "$UA_DIR/knowledge-graph.json" ]; then
-     echo "No knowledge graph found. Run /understand first to analyze this project."
-     exit 1
-   fi
-   ```
-
-3. Find the dashboard code. The dashboard is at `packages/dashboard/` relative to this plugin's root directory. Check these paths in order and use the first that exists:
-   - `${CLAUDE_PLUGIN_ROOT}/packages/dashboard/` (Claude Code runtime root, highest priority)
-   - `~/.understand-anything-plugin/packages/dashboard/` (universal symlink, all installs)
+2. Find the plugin root. The dashboard is served by the plugin's own viewer at `packages/viewer/` relative to this plugin's root directory. Check these roots in order and use the first that contains `packages/viewer/bin/viewer.mjs`:
+   - `${CLAUDE_PLUGIN_ROOT}` (Claude Code runtime root, highest priority)
+   - `~/.understand-anything-plugin` (universal symlink, all installs)
    - Two levels up from `~/.agents/skills/understand-dashboard` real path (self-relative fallback)
    - Two levels up from `~/.copilot/skills/understand-dashboard` real path (Copilot personal skills fallback)
    - Common clone-based install roots:
-     - `~/.codex/understand-anything/understand-anything-plugin/packages/dashboard/`
-     - `~/.opencode/understand-anything/understand-anything-plugin/packages/dashboard/`
-     - `~/.pi/understand-anything/understand-anything-plugin/packages/dashboard/`
-     - `~/understand-anything/understand-anything-plugin/packages/dashboard/`
+     - `~/.codex/understand-anything/understand-anything-plugin`
+     - `~/.opencode/understand-anything/understand-anything-plugin`
+     - `~/.pi/understand-anything/understand-anything-plugin`
+     - `~/understand-anything/understand-anything-plugin`
 
    Use the Bash tool to resolve:
    ```bash
@@ -77,13 +64,13 @@ Start the Understand Anything dashboard to visualize the knowledge graph for the
      "$HOME/.opencode/understand-anything/understand-anything-plugin" \
      "$HOME/.pi/understand-anything/understand-anything-plugin" \
      "$HOME/understand-anything/understand-anything-plugin"; do
-     if [ -n "$candidate" ] && [ -d "$candidate/packages/dashboard" ]; then
+     if [ -n "$candidate" ] && [ -f "$candidate/packages/viewer/bin/viewer.mjs" ]; then
        PLUGIN_ROOT="$candidate"; break
      fi
    done
 
    if [ -z "$PLUGIN_ROOT" ]; then
-     echo "Error: Cannot find the understand-anything plugin root."
+     echo "Error: Cannot find the understand-the-job plugin root."
      echo "Checked:"
      echo "  - ${CLAUDE_PLUGIN_ROOT:-<unset CLAUDE_PLUGIN_ROOT>}"
      echo "  - $HOME/.understand-anything-plugin"
@@ -97,42 +84,49 @@ Start the Understand Anything dashboard to visualize the knowledge graph for the
      exit 1
    fi
 
-   DASHBOARD_DIR="$PLUGIN_ROOT/packages/dashboard"
+   VIEWER_DIR="$PLUGIN_ROOT/packages/viewer"
    ```
 
-4. **Fast path — try the prebuilt viewer first (no install, no build).** Each release ships a self-contained viewer tarball; run it pinned to the installed plugin version:
+3. **Data directory safety check.** Before anything reads the data directory, run the bundled check:
    ```bash
-   : "${PLUGIN_ROOT:?Run step 3 first so PLUGIN_ROOT is set}"
+   : "${PLUGIN_ROOT:?Run step 2 first so PLUGIN_ROOT is set}"
    : "${PROJECT_DIR:?Run step 1 first so PROJECT_DIR is set}"
-   PLUGIN_VERSION=$(node -p "require('$PLUGIN_ROOT/package.json').version")
-   VIEWER_URL="https://github.com/Egonex-AI/Understand-Anything/releases/download/v${PLUGIN_VERSION}/understand-anything-viewer.tgz"
-   npx --yes "$VIEWER_URL" "$PROJECT_DIR"
+   node "$PLUGIN_ROOT/skills/understand/ensure-safe-data-dir.mjs" "$PROJECT_DIR"
    ```
-   Run this in the background. It prints the same `🔑  Dashboard URL` line as the dev server:
-   - If the line appears, **skip steps 5-6** and continue at step 7.
-   - If the process exits without printing it (no release asset for this version, or no network), fall back to steps 5-6.
+   If it exits non-zero, show its one-line reason to the user and **STOP**. It rejects a data directory (`.ua/`, or legacy `.understand-anything/`) that is a symlink, contains a symlink, or resolves outside the project, which could otherwise make the dashboard serve files from elsewhere on disk.
 
-5. Fallback: install dependencies and build if needed:
-   ```bash
-   : "${PLUGIN_ROOT:?Run step 3 first so PLUGIN_ROOT is set}"
-   DASHBOARD_DIR="${DASHBOARD_DIR:-$PLUGIN_ROOT/packages/dashboard}"
-   cd "$DASHBOARD_DIR" && (pnpm install --frozen-lockfile 2>/dev/null || pnpm install)
+4. Check that `$UA_DIR/knowledge-graph.json` exists in the project directory. If not, tell the user:
    ```
-   Then ensure the core package is built (the dashboard depends on it):
-   ```bash
-   : "${PLUGIN_ROOT:?Run step 3 first so PLUGIN_ROOT is set}"
-   cd "$PLUGIN_ROOT" && pnpm --filter @understand-anything/core build
+   No knowledge graph found. Run /understand first to analyze this project.
    ```
 
-6. Fallback: start the Vite dev server pointing at the project's knowledge graph:
+   Use the Bash tool to check:
+   ```bash
+   if [ ! -f "$UA_DIR/knowledge-graph.json" ]; then
+     echo "No knowledge graph found. Run /understand first to analyze this project."
+     exit 1
+   fi
+   ```
+
+5. **Build the local viewer if needed.** The viewer embeds a build of the plugin's own dashboard; nothing is downloaded or run from the internet. Build it only when its output is missing:
+   ```bash
+   : "${PLUGIN_ROOT:?Run step 2 first so PLUGIN_ROOT is set}"
+   VIEWER_DIR="${VIEWER_DIR:-$PLUGIN_ROOT/packages/viewer}"
+   if [ ! -f "$VIEWER_DIR/dist/index.html" ] || [ ! -f "$VIEWER_DIR/bin/dist/staleness.js" ]; then
+     cd "$PLUGIN_ROOT" && pnpm install --frozen-lockfile && pnpm --filter understand-anything-viewer build
+   fi
+   ```
+   If `pnpm install --frozen-lockfile` or the build fails, relay the error and **STOP**. Never fall back to `pnpm install` without `--frozen-lockfile`, to `npx`, or to a downloaded prebuilt viewer.
+
+6. Start the viewer, pointing at the project's knowledge graph:
    ```bash
    : "${PROJECT_DIR:?Run step 1 first so PROJECT_DIR is set}"
-   : "${DASHBOARD_DIR:?Run step 5 first so DASHBOARD_DIR is set}"
-   cd "$DASHBOARD_DIR" && GRAPH_DIR="$PROJECT_DIR" npx vite --host 127.0.0.1
+   : "${VIEWER_DIR:?Run step 2 first so VIEWER_DIR is set}"
+   node "$VIEWER_DIR/bin/viewer.mjs" "$PROJECT_DIR"
    ```
    Run this in the background so the user can continue working.
 
-7. **Capture the access token URL from the server output.** The server (viewer or Vite) prints a line like:
+7. **Capture the access token URL from the server output.** The viewer prints a line like:
    ```
    🔑  Dashboard URL: http://127.0.0.1:<PORT>?token=<TOKEN>
    ```
@@ -149,7 +143,8 @@ Start the Understand Anything dashboard to visualize the knowledge graph for the
 
 ## Notes
 
-- The fast path (step 4) downloads a version-pinned, self-contained viewer from the GitHub release — nothing is installed into the plugin directory and no build runs
-- The dashboard auto-opens in the default browser (both the viewer and Vite's `--open`)
-- If port 5173 is already in use, the next available port is picked (both paths)
-- In the fallback, the `GRAPH_DIR` environment variable tells the dev server where to find the knowledge graph
+- The dashboard runs from the plugin's own local sources (`packages/viewer`, which embeds the built `packages/dashboard`). It never downloads or runs code from the internet: no `npx <url>`, no release tarballs, and dependency installs use only `pnpm install --frozen-lockfile`
+- The viewer binds to `127.0.0.1`, serves the graph read-only, and gates every data endpoint behind the one-time `?token=`
+- The dashboard auto-opens in the default browser
+- If port 5173 is already in use, the next available port is picked
+- After a plugin update, delete `packages/viewer/dist` so step 5 rebuilds the viewer from the updated sources
