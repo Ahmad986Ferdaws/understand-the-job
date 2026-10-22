@@ -9,26 +9,192 @@ Handles: entity deduplication, edge normalization, layer building from
 index.md categories, tour generation from index.md section ordering.
 
 Usage:
-    python merge-knowledge-graph.py <wiki-directory>
+    python merge-knowledge-graph.py <wiki-directory> [--force]
 
 Output:
     Writes assembled-graph.json to <wiki-directory>/<ua-dir>/intermediate/, where
     <ua-dir> is `.ua/` (or legacy `.understand-anything/` when that directory
     already exists).
+
+Safety:
+    The data directory lives inside the (untrusted) project, so the script
+    refuses to run when the directory, or anything inside it, is a symlink
+    (exit 2), and it writes through a temp file + rename so a symlinked target
+    is replaced rather than followed.
+
+    The data directory is shared with /understand. When it already holds a code
+    graph, the script refuses (exit 3) so the later "save" step cannot destroy
+    it. Pass --force to proceed anyway.
 """
+
+from __future__ import annotations
 
 import json
 import os
 import re
+import secrets
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+EXIT_UNSAFE_DATA_DIR = 2
+EXIT_WOULD_OVERWRITE = 3
+
+
+class UnsafeDataDir(Exception):
+    """The data directory is a symlink, contains one, or escapes the project."""
+
+
+class WouldOverwriteCodeGraph(Exception):
+    """The data directory already holds a graph produced by /understand."""
+
 
 def resolve_ua_dir(root: Path) -> Path:
-    """Mirror core resolveUaDir: legacy .understand-anything/ wins if present."""
+    """Mirror core resolveUaDir: legacy .understand-anything/ wins if present.
+
+    Uses lexists so a symlinked (even dangling) legacy dir still counts as
+    present - it is then rejected by assert_safe_data_dir instead of being
+    silently skipped in favour of .ua/.
+    """
     legacy = root / ".understand-anything"
-    return legacy if legacy.is_dir() else root / ".ua"
+    return legacy if os.path.lexists(legacy) else root / ".ua"
+
+
+def _printable(text: object) -> str:
+    """Keep reasons on one line and free of control characters (file names come from the repo)."""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", "?", str(text))
+
+
+def _is_link(entry: os.DirEntry) -> bool:
+    if entry.is_symlink():
+        return True
+    is_junction = getattr(entry, "is_junction", None)  # Python 3.12+, Windows junctions
+    return bool(is_junction and is_junction())
+
+
+def assert_safe_data_dir(root: Path) -> Path:
+    """Raise UnsafeDataDir unless the data dir is absent or safe; return its path.
+
+    Unsafe = the dir is a symlink, anything inside it is a symlink, its
+    realpath is outside realpath(root), or it is not a directory.
+    """
+    ua_dir = resolve_ua_dir(root)
+    name = ua_dir.name
+
+    def fail(reason: str) -> None:
+        raise UnsafeDataDir(f"refusing to use {name}/: {_printable(reason)}")
+
+    try:
+        st = os.lstat(ua_dir)
+    except (FileNotFoundError, NotADirectoryError):
+        return ua_dir  # first run: nothing to protect yet
+    except OSError as e:
+        fail(f"cannot inspect it ({e.strerror or e})")
+    if stat.S_ISLNK(st.st_mode):
+        fail("it is a symbolic link")
+    if not stat.S_ISDIR(st.st_mode):
+        fail("it exists but is not a directory")
+
+    real_root = os.path.realpath(root)
+    real_dir = os.path.realpath(ua_dir)
+    try:
+        rel = os.path.relpath(real_dir, real_root)
+    except ValueError:  # different drives on Windows
+        rel = os.pardir
+    if rel in (".", "") or rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        fail("it resolves outside the project root")
+
+    pending = [str(ua_dir)]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as it:
+                entries = list(it)
+        except OSError as e:
+            fail(f"cannot read {os.path.relpath(current, ua_dir)} ({e.strerror or e})")
+        for entry in entries:
+            if _is_link(entry):
+                fail(f"{os.path.relpath(entry.path, ua_dir)} is a symbolic link")
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(entry.path)
+    return ua_dir
+
+
+def _safe_write_text(root: Path, directory: Path, name: str, text: str) -> None:
+    """Write `directory/name` without following symlinks: exclusive temp file + atomic replace."""
+    assert_safe_data_dir(root)
+    directory.mkdir(parents=True, exist_ok=True)
+    assert_safe_data_dir(root)  # re-check after creating the directory
+    target = directory / name
+    tmp = directory / f".{name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, target)  # replaces a symlink at `target`, never writes through it
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# Node types that only a code analysis produces (knowledge graphs share the
+# type vocabulary for compatibility, but they carry kind: "knowledge").
+CODE_NODE_TYPES = {"file", "function", "class"}
+
+
+def _read_json(path: Path) -> tuple[bool, object]:
+    """(present, value). value is None when the file exists but cannot be parsed."""
+    if not os.path.lexists(path):
+        return False, None
+    try:
+        return True, json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True, None
+
+
+def existing_graph_verdict(ua_dir: Path) -> str | None:
+    """Describe an existing graph the script must not clobber, or None if it is safe to replace.
+
+    kind "knowledge"/"design" graphs are replaceable. Graphs from /understand
+    may have lost their `kind` (core validation drops it), so they are
+    recognised by code-type nodes or by a meta.json that records a git commit.
+    Anything unreadable is treated as someone's work and protected.
+    """
+    g_present, graph = _read_json(ua_dir / "knowledge-graph.json")
+    m_present, meta = _read_json(ua_dir / "meta.json")
+    meta_is_code = (
+        isinstance(meta, dict)
+        and isinstance(meta.get("gitCommitHash"), str)
+        and meta["gitCommitHash"] != ""
+        and "figmaVersion" not in meta
+    )
+
+    if not g_present:
+        return "a meta.json recording a git commit (from /understand)" if meta_is_code else None
+    if not isinstance(graph, dict):
+        return "an unreadable knowledge-graph.json"
+    kind = graph.get("kind")
+    if kind in ("knowledge", "design"):
+        return None
+    if kind == "codebase":
+        return "a code graph (kind: codebase)"
+    nodes = graph.get("nodes")
+    if isinstance(nodes, list) and any(
+        isinstance(n, dict) and n.get("type") in CODE_NODE_TYPES for n in nodes
+    ):
+        return "a code graph (file/function/class nodes)"
+    if meta_is_code:
+        return "a graph whose meta.json records a git commit (from /understand)"
+    return None
 
 
 def _find_markdown_case_insensitive(parent: Path, name: str) -> Path:
@@ -117,8 +283,20 @@ def normalize_entity_name(name: str) -> str:
 # Merge pipeline
 # ---------------------------------------------------------------------------
 
-def merge(root: Path) -> dict:
-    intermediate = resolve_ua_dir(root) / "intermediate"
+def merge(root: Path, force: bool = False) -> dict:
+    ua_dir = assert_safe_data_dir(root)  # raises UnsafeDataDir
+    existing = existing_graph_verdict(ua_dir)
+    if existing:
+        if not force:
+            raise WouldOverwriteCodeGraph(
+                f"Refusing to continue: {ua_dir} already holds {existing}, and this "
+                f"run would replace it with a knowledge graph. Re-run with --force "
+                f"to replace it, or analyze the wiki from a different folder."
+            )
+        print(f"[merge] --force: {ua_dir} holds {existing}; it will be replaced",
+              file=sys.stderr)
+
+    intermediate = ua_dir / "intermediate"
     manifest_path = intermediate / "scan-manifest.json"
 
     if not manifest_path.is_file():
@@ -392,7 +570,7 @@ def merge(root: Path) -> dict:
 
     # Write output
     out_path = intermediate / "assembled-graph.json"
-    out_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
+    _safe_write_text(root, intermediate, "assembled-graph.json", json.dumps(graph, indent=2))
 
     # Report
     print(f"[merge] Input: {report['base_nodes']} scan nodes, "
@@ -410,16 +588,26 @@ def merge(root: Path) -> dict:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: merge-knowledge-graph.py <wiki-directory>", file=sys.stderr)
+    args = sys.argv[1:]
+    force = "--force" in args
+    positional = [a for a in args if not a.startswith("--")]
+    if len(positional) != 1:
+        print("Usage: merge-knowledge-graph.py <wiki-directory> [--force]", file=sys.stderr)
         sys.exit(1)
 
-    root = Path(sys.argv[1]).resolve()
+    root = Path(positional[0]).resolve()
     if not root.is_dir():
         print(f"Error: {root} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    merge(root)
+    try:
+        merge(root, force=force)
+    except UnsafeDataDir as e:
+        print(f"Unsafe data directory: {e}", file=sys.stderr)
+        sys.exit(EXIT_UNSAFE_DATA_DIR)
+    except WouldOverwriteCodeGraph as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(EXIT_WOULD_OVERWRITE)
 
 
 if __name__ == "__main__":

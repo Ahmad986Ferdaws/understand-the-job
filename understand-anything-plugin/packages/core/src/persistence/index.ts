@@ -1,8 +1,16 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, isAbsolute, relative, basename } from "node:path";
 import type { KnowledgeGraph, AnalysisMeta, ProjectConfig } from "../types.js";
 import type { FingerprintStore } from "../fingerprint.js";
 import { validateGraph } from "../schema.js";
+import {
+  UnsafeDataDirError,
+  assertSafeDir,
+  existsNoFollow,
+  safeReadFile,
+  safeWriteFile,
+} from "./safe-io.js";
+
+export { UnsafeDataDirError } from "./safe-io.js";
 
 const UA_DIR = ".ua";
 const LEGACY_UA_DIR = ".understand-anything";
@@ -17,7 +25,10 @@ const CONFIG_FILE = "config.json";
  * reads and writes (no migration needed); fresh projects get `.ua/`.
  */
 export function resolveUaDirName(projectRoot: string): string {
-  return existsSync(join(projectRoot, LEGACY_UA_DIR)) ? LEGACY_UA_DIR : UA_DIR;
+  // lstat-based: a symlinked (even dangling) `.understand-anything` still
+  // counts as "present", so the safety check below sees it and refuses it
+  // instead of silently falling through to `.ua/`.
+  return existsNoFollow(join(projectRoot, LEGACY_UA_DIR)) ? LEGACY_UA_DIR : UA_DIR;
 }
 
 /** Absolute path of the project's data directory (see resolveUaDirName). */
@@ -25,12 +36,41 @@ export function resolveUaDir(projectRoot: string): string {
   return join(projectRoot, resolveUaDirName(projectRoot));
 }
 
-function ensureDir(projectRoot: string): string {
-  const dir = resolveUaDir(projectRoot);
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+/**
+ * Throws UnsafeDataDirError if the project's data directory is a symlink or
+ * resolves outside the project root. A missing directory is fine.
+ */
+export function assertSafeUaDir(projectRoot: string): void {
+  assertSafeDir(projectRoot, resolveUaDir(projectRoot));
+}
+
+/**
+ * Every write to the data directory goes through here: the directory is
+ * checked for symlinks / escapes, and the file is written to an exclusive temp
+ * file and renamed into place, so a symlinked target is replaced rather than
+ * followed.
+ */
+function writeUaFile(projectRoot: string, fileName: string, content: string): void {
+  safeWriteFile(projectRoot, resolveUaDir(projectRoot), fileName, content);
+}
+
+/** Read a data-directory file (null if absent); refuses symlinks. */
+function readUaFile(projectRoot: string, fileName: string): string | null {
+  return safeReadFile(projectRoot, resolveUaDir(projectRoot), fileName);
+}
+
+/**
+ * Like readUaFile, but ordinary I/O errors (unreadable file) map to null so
+ * lenient loaders keep their fall-back behaviour. Symlink / escape refusals
+ * are never swallowed.
+ */
+function readUaFileLenient(projectRoot: string, fileName: string): string | null {
+  try {
+    return readUaFile(projectRoot, fileName);
+  } catch (err) {
+    if (err instanceof UnsafeDataDirError) throw err;
+    return null;
   }
-  return dir;
 }
 
 /**
@@ -82,29 +122,23 @@ function sanitiseFilePaths(
 }
 
 export function saveGraph(projectRoot: string, graph: KnowledgeGraph): void {
-  const dir = ensureDir(projectRoot);
-
   // FIX — sanitise absolute file paths before persisting.
   // Without this, absolute paths like /Users/alice/company/src/auth.ts
   // are written verbatim into knowledge-graph.json and later served
   // by the dashboard server, leaking the developer's directory layout.
   const sanitised = sanitiseFilePaths(graph, projectRoot);
 
-  writeFileSync(
-    join(dir, GRAPH_FILE),
-    JSON.stringify(sanitised, null, 2),
-    "utf-8",
-  );
+  writeUaFile(projectRoot, GRAPH_FILE, JSON.stringify(sanitised, null, 2));
 }
 
 export function loadGraph(
   projectRoot: string,
   options?: { validate?: boolean },
 ): KnowledgeGraph | null {
-  const filePath = join(resolveUaDir(projectRoot), GRAPH_FILE);
-  if (!existsSync(filePath)) return null;
+  const text = readUaFile(projectRoot, GRAPH_FILE);
+  if (text === null) return null;
 
-  const data = JSON.parse(readFileSync(filePath, "utf-8"));
+  const data = JSON.parse(text);
 
   if (options?.validate !== false) {
     const result = validateGraph(data);
@@ -120,26 +154,24 @@ export function loadGraph(
 }
 
 export function saveMeta(projectRoot: string, meta: AnalysisMeta): void {
-  const dir = ensureDir(projectRoot);
-  writeFileSync(join(dir, META_FILE), JSON.stringify(meta, null, 2), "utf-8");
+  writeUaFile(projectRoot, META_FILE, JSON.stringify(meta, null, 2));
 }
 
 export function loadMeta(projectRoot: string): AnalysisMeta | null {
-  const filePath = join(resolveUaDir(projectRoot), META_FILE);
-  if (!existsSync(filePath)) return null;
-  return JSON.parse(readFileSync(filePath, "utf-8")) as AnalysisMeta;
+  const text = readUaFile(projectRoot, META_FILE);
+  if (text === null) return null;
+  return JSON.parse(text) as AnalysisMeta;
 }
 
 export function saveFingerprints(projectRoot: string, store: FingerprintStore): void {
-  const dir = ensureDir(projectRoot);
-  writeFileSync(join(dir, FINGERPRINT_FILE), JSON.stringify(store, null, 2), "utf-8");
+  writeUaFile(projectRoot, FINGERPRINT_FILE, JSON.stringify(store, null, 2));
 }
 
 export function loadFingerprints(projectRoot: string): FingerprintStore | null {
-  const filePath = join(resolveUaDir(projectRoot), FINGERPRINT_FILE);
-  if (!existsSync(filePath)) return null;
+  const text = readUaFileLenient(projectRoot, FINGERPRINT_FILE);
+  if (text === null) return null;
   try {
-    return JSON.parse(readFileSync(filePath, "utf-8")) as FingerprintStore;
+    return JSON.parse(text) as FingerprintStore;
   } catch {
     return null;
   }
@@ -148,15 +180,14 @@ export function loadFingerprints(projectRoot: string): FingerprintStore | null {
 const DEFAULT_CONFIG: ProjectConfig = { autoUpdate: false, outputLanguage: "en" };
 
 export function saveConfig(projectRoot: string, config: ProjectConfig): void {
-  const dir = ensureDir(projectRoot);
-  writeFileSync(join(dir, CONFIG_FILE), JSON.stringify(config, null, 2), "utf-8");
+  writeUaFile(projectRoot, CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
 export function loadConfig(projectRoot: string): ProjectConfig {
-  const filePath = join(resolveUaDir(projectRoot), CONFIG_FILE);
-  if (!existsSync(filePath)) return { ...DEFAULT_CONFIG };
+  const text = readUaFileLenient(projectRoot, CONFIG_FILE);
+  if (text === null) return { ...DEFAULT_CONFIG };
   try {
-    return JSON.parse(readFileSync(filePath, "utf-8")) as ProjectConfig;
+    return JSON.parse(text) as ProjectConfig;
   } catch {
     return { ...DEFAULT_CONFIG };
   }
@@ -165,23 +196,18 @@ export function loadConfig(projectRoot: string): ProjectConfig {
 const DOMAIN_GRAPH_FILE = "domain-graph.json";
 
 export function saveDomainGraph(projectRoot: string, graph: KnowledgeGraph): void {
-  const dir = ensureDir(projectRoot);
   const sanitised = sanitiseFilePaths(graph, projectRoot);
-  writeFileSync(
-    join(dir, DOMAIN_GRAPH_FILE),
-    JSON.stringify(sanitised, null, 2),
-    "utf-8",
-  );
+  writeUaFile(projectRoot, DOMAIN_GRAPH_FILE, JSON.stringify(sanitised, null, 2));
 }
 
 export function loadDomainGraph(
   projectRoot: string,
   options?: { validate?: boolean },
 ): KnowledgeGraph | null {
-  const filePath = join(resolveUaDir(projectRoot), DOMAIN_GRAPH_FILE);
-  if (!existsSync(filePath)) return null;
+  const text = readUaFile(projectRoot, DOMAIN_GRAPH_FILE);
+  if (text === null) return null;
 
-  const data = JSON.parse(readFileSync(filePath, "utf-8"));
+  const data = JSON.parse(text);
 
   if (options?.validate !== false) {
     const result = validateGraph(data);

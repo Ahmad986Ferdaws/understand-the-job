@@ -2,6 +2,7 @@ import ignore, { type Ignore } from "ignore";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { resolveUaDir } from "./persistence/index.js";
+import { safeReadFile } from "./persistence/safe-io.js";
 
 /**
  * Hardcoded default ignore patterns matching the project-scanner agent's
@@ -50,6 +51,52 @@ export const DEFAULT_IGNORE_PATTERNS: string[] = [
   "*.zip",
   "*.tar",
   "*.gz",
+  "*.webp",
+  "*.avif",
+  "*.bmp",
+  "*.mov",
+  "*.webm",
+  "*.avi",
+  "*.mkv",
+  "*.wav",
+  "*.flac",
+  "*.ogg",
+  "*.m4a",
+  "*.otf",
+  "*.tgz",
+  "*.bz2",
+  "*.xz",
+  "*.7z",
+  "*.rar",
+
+  // Compiled / native / packaged artefacts
+  "*.wasm",
+  "*.so",
+  "*.dylib",
+  "*.dll",
+  "*.exe",
+  "*.o",
+  "*.a",
+  "*.jar",
+  "*.war",
+  "*.class",
+  "*.whl",
+  "*.dmg",
+  "*.iso",
+
+  // Databases, datasets and ML model weights
+  "*.sqlite",
+  "*.sqlite3",
+  "*.db",
+  "*.parquet",
+  "*.onnx",
+  "*.pt",
+  "*.pth",
+  "*.ckpt",
+  "*.safetensors",
+  "*.h5",
+  "*.npy",
+  "*.npz",
 
   // Generated files
   "*.min.js",
@@ -69,6 +116,16 @@ export const DEFAULT_IGNORE_PATTERNS: string[] = [
   ".prettierrc",
   ".eslintrc*",
   "*.log",
+
+  // Source-tree rescue. `build/`, `out/` and `vendor/` above match at any
+  // depth so that monorepo modules (`packages/api/build/`) are dropped too,
+  // but the same names are ordinary package segments under a source root
+  // (`src/main/java/com/acme/build/Compiler.java`). Anything below a `src`
+  // directory is real source, so re-include it. Order matters: this must come
+  // after the patterns it overrides, and user patterns still win over both.
+  "!**/src/**/build/",
+  "!**/src/**/out/",
+  "!**/src/**/vendor/",
 ];
 
 export interface IgnoreFilter {
@@ -94,10 +151,14 @@ export function createIgnoreFilter(projectRoot: string, extraPatterns: string[] 
   ig.add(DEFAULT_IGNORE_PATTERNS);
 
   // Layer 2: <ua-dir>/.understandignore
-  const projectIgnorePath = join(resolveUaDir(projectRoot), ".understandignore");
-  if (existsSync(projectIgnorePath)) {
-    const content = readFileSync(projectIgnorePath, "utf-8");
-    ig.add(content);
+  // Read through the symlink-refusing helper: the data dir is repo content.
+  const projectIgnore = safeReadFile(
+    projectRoot,
+    resolveUaDir(projectRoot),
+    ".understandignore",
+  );
+  if (projectIgnore !== null) {
+    ig.add(projectIgnore);
   }
 
   // Layer 3: .understandignore at project root

@@ -61,32 +61,69 @@ describe("getChangedFiles", () => {
   it("returns changed file list from git diff", () => {
     mockedExecFileSync.mockReturnValue("src/index.ts\nsrc/utils.ts\n");
 
-    const result = getChangedFiles("/project", "abc123");
+    const result = getChangedFiles("/project", "abc1234");
 
     expect(result).toEqual(["src/index.ts", "src/utils.ts"]);
     expect(mockedExecFileSync).toHaveBeenCalledWith(
       "git",
-      ["diff", "abc123..HEAD", "--name-only"],
-      { cwd: "/project", encoding: "utf-8" },
+      ["diff", "--name-only", "--end-of-options", "abc1234..HEAD", "--"],
+      expect.objectContaining({ cwd: "/project", encoding: "utf-8", timeout: 5_000 }),
     );
   });
 
   it("returns empty array when no changes", () => {
     mockedExecFileSync.mockReturnValue("");
 
-    const result = getChangedFiles("/project", "abc123");
+    const result = getChangedFiles("/project", "abc1234");
 
     expect(result).toEqual([]);
   });
 
-  it("returns empty array on git error", () => {
+  it("returns null (unknown) on git error", () => {
     mockedExecFileSync.mockImplementation(() => {
       throw new Error("fatal: bad revision");
     });
 
-    const result = getChangedFiles("/project", "abc123");
+    const result = getChangedFiles("/project", "abc1234");
 
-    expect(result).toEqual([]);
+    expect(result).toBeNull();
+  });
+
+  it.each([
+    "",
+    "abc123", // too short to be a commit id
+    "--output=/tmp/pwned",
+    "-abcdef0",
+    "HEAD~1",
+    "main",
+    "abc1234..def5678",
+    "abc1234 --stat",
+    "abc1234\n--output=/tmp/x",
+    "g".repeat(40),
+    "a".repeat(65),
+  ])("never runs git for the invalid hash %j", (hash) => {
+    const result = getChangedFiles("/project", hash);
+
+    expect(result).toBeNull();
+    expect(mockedExecFileSync).not.toHaveBeenCalled();
+  });
+
+  it("accepts full SHA-1 and SHA-256 hashes in any case", () => {
+    mockedExecFileSync.mockReturnValue("");
+
+    expect(getChangedFiles("/project", "a".repeat(40))).toEqual([]);
+    expect(getChangedFiles("/project", "AB12CD3")).toEqual([]);
+    expect(getChangedFiles("/project", "0123456789abcdef".repeat(4))).toEqual([]);
+    expect(mockedExecFileSync).toHaveBeenCalledTimes(3);
+  });
+
+  it("puts the hash after --end-of-options so it can never be read as a flag", () => {
+    mockedExecFileSync.mockReturnValue("");
+
+    getChangedFiles("/project", "abc1234");
+
+    const args = mockedExecFileSync.mock.calls[0][1] as string[];
+    expect(args.indexOf("--end-of-options")).toBeLessThan(args.indexOf("abc1234..HEAD"));
   });
 });
 
@@ -94,7 +131,7 @@ describe("isStale", () => {
   it("returns stale when files have changed", () => {
     mockedExecFileSync.mockReturnValue("src/index.ts\n");
 
-    const result = isStale("/project", "abc123");
+    const result = isStale("/project", "abc1234");
 
     expect(result).toEqual({
       stale: true,
@@ -105,12 +142,29 @@ describe("isStale", () => {
   it("returns not stale when no files changed", () => {
     mockedExecFileSync.mockReturnValue("");
 
-    const result = isStale("/project", "abc123");
+    const result = isStale("/project", "abc1234");
 
     expect(result).toEqual({
       stale: false,
       changedFiles: [],
     });
+  });
+
+  it("reports stale + unknown (not fresh) when git fails", () => {
+    mockedExecFileSync.mockImplementation(() => {
+      throw new Error("fatal: not a git repository");
+    });
+
+    const result = isStale("/project", "abc1234");
+
+    expect(result).toEqual({ stale: true, changedFiles: [], unknown: true });
+  });
+
+  it("reports stale + unknown for an invalid hash without calling git", () => {
+    const result = isStale("/project", "--output=/tmp/pwned");
+
+    expect(result).toEqual({ stale: true, changedFiles: [], unknown: true });
+    expect(mockedExecFileSync).not.toHaveBeenCalled();
   });
 });
 

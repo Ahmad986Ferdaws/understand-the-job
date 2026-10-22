@@ -4,6 +4,12 @@ import type { KnowledgeGraph, GraphNode, GraphEdge } from "./types.js";
 export interface StalenessResult {
   stale: boolean;
   changedFiles: string[];
+  /**
+   * True when git could not answer (bad or unrecorded commit hash, git
+   * missing, timeout). The graph is then reported stale rather than fresh —
+   * "I could not check" must never read as "nothing changed".
+   */
+  unknown?: boolean;
 }
 
 export type GraphFreshnessRelation = "behind" | "ahead" | "diverged";
@@ -358,33 +364,56 @@ function parseChangedFiles(output: string): string[] {
     .filter((line) => line.length > 0);
 }
 
+/** A full or abbreviated git object id: 7-64 hex digits (SHA-1 or SHA-256). */
+const COMMIT_HASH_PATTERN = /^[0-9a-f]{7,64}$/i;
+
 /**
  * Get the list of files that changed between a given commit and HEAD.
- * Returns an empty array if there are no changes or if git encounters an error.
+ *
+ * Returns an empty array when nothing changed, and `null` when the answer is
+ * unknown: the hash is not a plausible commit id (it may come from a
+ * committed meta.json, so it is never passed to git unless it is plain hex)
+ * or git failed. Callers must not treat `null` as "no changes".
  */
 export function getChangedFiles(
   projectDir: string,
   lastCommitHash: string,
-): string[] {
+): string[] | null {
+  if (typeof lastCommitHash !== "string" || !COMMIT_HASH_PATTERN.test(lastCommitHash)) {
+    return null;
+  }
   try {
-    const output = execFileSync("git", ["diff", `${lastCommitHash}..HEAD`, "--name-only"], {
-      cwd: projectDir,
-      encoding: "utf-8",
-    });
+    const output = execFileSync(
+      "git",
+      ["diff", "--name-only", "--end-of-options", `${lastCommitHash}..HEAD`, "--"],
+      {
+        cwd: projectDir,
+        encoding: "utf-8",
+        timeout: GIT_TIMEOUT_MS,
+        maxBuffer: GIT_MAX_BUFFER_BYTES,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
     return parseChangedFiles(output);
   } catch {
-    return [];
+    return null;
   }
 }
 
 /**
  * Check whether the knowledge graph is stale relative to the current HEAD.
+ * When the comparison cannot be made, the graph is reported stale with
+ * `unknown: true` instead of fresh.
  */
 export function isStale(
   projectDir: string,
   lastCommitHash: string,
 ): StalenessResult {
   const changedFiles = getChangedFiles(projectDir, lastCommitHash);
+  if (changedFiles === null) {
+    return { stale: true, changedFiles: [], unknown: true };
+  }
   return {
     stale: changedFiles.length > 0,
     changedFiles,
