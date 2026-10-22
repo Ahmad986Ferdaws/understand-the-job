@@ -38,7 +38,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(__dirname, '../..');
 export const REPORT_SCHEMA_VERSION = '1.0.0';
 export const REPORT_SCHEMA_URL =
-  'https://raw.githubusercontent.com/Egonex-AI/Understand-Anything/main/docs/benchmarks/large-repo-report-1.0.0.schema.json';
+  'https://raw.githubusercontent.com/Ahmad986Ferdaws/understand-the-job/main/docs/benchmarks/large-repo-report-1.0.0.schema.json';
 
 const WORKER = resolve(__dirname, 'benchmark-stage-worker.mjs');
 const SCAN_SCRIPT = resolve(

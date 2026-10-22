@@ -1,14 +1,14 @@
 {
-  "name": "understand-anything",
+  "name": "understand-the-job",
   "metadata": {
     "description": "LLM-powered codebase analysis producing interactive knowledge graphs, guided tours, and deep-dive explanations"
   },
   "owner": {
-    "name": "Egonex"
+    "name": "Ahmad986Ferdaws"
   },
   "plugins": [
     {
-      "name": "understand-anything",
+      "name": "understand-the-job",
       "source": "./understand-anything-plugin"
     }
   ]

@@ -14,13 +14,21 @@ Swift repo and verified the dashboard shows non-empty edges" is better. -->
 - [ ] `pnpm lint`
 - [ ] `pnpm --filter @understand-anything/core test`
 - [ ] `pnpm test`
+- [ ] Python helper tests (see CONTRIBUTING.md), if you touched `tests/**/test_*.py` or the Python scripts
 - [ ] Manual smoke test (describe above)
+
+## Security model
+
+<!-- Any change that runs code, writes files, or touches the network must keep
+the "Security model" in README.md true. -->
+
+- [ ] This PR doesn't run code, write files, or touch the network, OR the README Security model is still true after it (explain below if the wording changed)
 
 ## Versioning
 
 <!-- If this PR ships a user-visible behavior change, bump the version in ALL
-five manifests per CLAUDE.md. If it's docs/tests/internal-only, leave them
+six manifests per CLAUDE.md. If it's docs/tests/internal-only, leave them
 alone and the maintainer will bump on merge. -->
 
-- [ ] Version bumped in all five manifests, OR
+- [ ] Version bumped in all six manifests, OR
 - [ ] N/A — internal/docs-only change

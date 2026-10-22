@@ -10,6 +10,10 @@ body:
         the faster it gets fixed. If you can include the analyzed project's
         primary language and an approximate file count, that's gold.
 
+        Security vulnerabilities do not belong here — please use
+        [private vulnerability reporting](https://github.com/Ahmad986Ferdaws/understand-the-job/security/advisories/new).
+        Don't paste secrets or private code into a public issue.
+
   - type: textarea
     id: what-happened
     attributes:
@@ -34,8 +38,8 @@ body:
     id: version
     attributes:
       label: Plugin version
-      description: Run `/understand --version` or check `~/.claude/plugins/cache/understand-anything/understand-anything/`.
-      placeholder: "e.g. 2.7.4"
+      description: Run `/understand --version` or check `~/.claude/plugins/cache/understand-the-job/understand-the-job/`.
+      placeholder: "e.g. 1.0.0"
     validations:
       required: true
 
@@ -80,6 +84,7 @@ body:
     attributes:
       label: Relevant logs
       description: |
-        Any console output, the contents of `.understand-anything/intermediate/`
-        if it still exists, or screenshots of the dashboard error.
+        Any console output, the contents of `.ua/intermediate/` (or
+        `.understand-anything/intermediate/` for legacy projects) if it still
+        exists, or screenshots of the dashboard error. Remove anything private first.
       render: shell

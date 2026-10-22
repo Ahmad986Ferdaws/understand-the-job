@@ -11,7 +11,6 @@ benchmark-results/
 __pycache__/
 .claude/
 .worktrees/
-homepage/public/demo/
 .private/
 .venv/
 venv/
@@ -19,3 +18,5 @@ venv/
 *.pyo
 Thumbs.db
 *.tgz
+.pnpm-store/
+node-compile-cache/

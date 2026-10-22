@@ -1,15 +1,24 @@
 <#
 .SYNOPSIS
-  Understand-Anything installer for Windows (PowerShell).
+  Understand the Job installer for Windows (PowerShell).
 
 .DESCRIPTION
   Clones the repo and creates skill symlinks/junctions for the chosen platform.
+  Installs a PINNED release: the clone is checked out at the tag in $env:UTJ_REF
+  (default v1.0.0), never at a moving branch. -Update re-fetches that same ref;
+  to move to a newer release, set UTJ_REF to its tag.
 
 .EXAMPLE
   ./install.ps1                       # prompt for platform
   ./install.ps1 codex                 # install for codex
-  ./install.ps1 -Update               # pull latest changes
+  ./install.ps1 -Update               # re-fetch the pinned ref
   ./install.ps1 -Uninstall codex      # remove links for codex
+
+.NOTES
+  Environment:
+    UTJ_REF       Tag (or branch) to install (default: v1.0.0)
+    UTJ_REPO_URL  Override clone URL (default: the official GitHub repo)
+    UTJ_DIR       Override clone destination (default: %USERPROFILE%\.understand-the-job\repo)
 #>
 
 param(
@@ -22,8 +31,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$RepoUrl    = if ($env:UA_REPO_URL) { $env:UA_REPO_URL } else { 'https://github.com/Egonex-AI/Understand-Anything.git' }
-$RepoDir    = if ($env:UA_DIR)      { $env:UA_DIR }      else { Join-Path $HOME '.understand-anything\repo' }
+$UtjRef     = if ($env:UTJ_REF)      { $env:UTJ_REF }      else { 'v1.0.0' }
+$RepoUrl    = if ($env:UTJ_REPO_URL) { $env:UTJ_REPO_URL } else { 'https://github.com/Ahmad986Ferdaws/understand-the-job.git' }
+$RepoDir    = if ($env:UTJ_DIR)      { $env:UTJ_DIR }      else { Join-Path $HOME '.understand-the-job\repo' }
+$RepoDir    = $RepoDir.TrimEnd('\', '/')
+# The SKILL.md files resolve the plugin through this exact path, so it keeps
+# the upstream name. Do not rename it without changing every skill.
 $PluginLink = Join-Path $HOME '.understand-anything-plugin'
 
 # Platform table - Target = skills directory; Style = "per-skill" | "folder"
@@ -46,11 +59,11 @@ $Platforms = [ordered]@{
 
 function Show-Usage {
     @"
-Understand-Anything installer (Windows)
+Understand the Job installer (Windows)
 
 Usage:
   install.ps1 [<platform>]                Install for <platform> (or prompt if omitted)
-  install.ps1 -Update                     Pull latest changes
+  install.ps1 -Update                     Re-fetch the pinned ref
   install.ps1 -Uninstall <platform>       Remove links for <platform>
   install.ps1 -Help
 
@@ -58,8 +71,9 @@ Supported platforms:
 $($Platforms.Keys -join ', ')
 
 Environment:
-  UA_REPO_URL   Override clone URL
-  UA_DIR        Override clone destination (default: %USERPROFILE%\.understand-anything\repo)
+  UTJ_REF       Tag (or branch) to install (default: v1.0.0)
+  UTJ_REPO_URL  Override clone URL (default: official repo)
+  UTJ_DIR       Override clone destination (default: %USERPROFILE%\.understand-the-job\repo)
 "@
 }
 
@@ -85,17 +99,67 @@ function Prompt-Platform {
 }
 
 function Get-SkillsRoot { Join-Path $RepoDir 'understand-anything-plugin\skills' }
+function Get-PluginRoot { Join-Path $RepoDir 'understand-anything-plugin' }
 
-function Clone-Or-Update {
+function Invoke-Git([string[]]$GitArgs) {
+    # Native commands do not honour $ErrorActionPreference, so check the exit code.
+    & git @GitArgs
+    if ($LASTEXITCODE -ne 0) { Write-Error "git $($GitArgs -join ' ') failed (exit $LASTEXITCODE)" }
+}
+
+# Both values come from the environment and end up on a git command line, so
+# reject anything that git could read as an option or a command-running
+# transport.
+function Assert-ValidInputs {
+    if ($UtjRef -notmatch '^[A-Za-z0-9._/][A-Za-z0-9._/-]*$' -or $UtjRef.Contains('..')) {
+        Write-Error "Invalid UTJ_REF '$UtjRef': use a tag or branch name (letters, digits, . _ - /)."
+    }
+    if ([string]::IsNullOrEmpty($RepoUrl) -or $RepoUrl.StartsWith('-') -or $RepoUrl.StartsWith('ext::')) {
+        Write-Error "Invalid UTJ_REPO_URL '$RepoUrl'."
+    }
+}
+
+function ConvertTo-NormalizedUrl([string]$Url) {
+    $u = $Url.TrimEnd('/')
+    if ($u.EndsWith('.git')) { $u = $u.Substring(0, $u.Length - 4) }
+    return $u.ToLowerInvariant()
+}
+
+# Refuse to fetch into (or run scripts from) a checkout of some other repo,
+# e.g. a leftover clone of the upstream project.
+function Assert-OriginMatches {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $actual = [string](& git -C $RepoDir remote get-url origin 2>$null) }
+    finally { $ErrorActionPreference = $prev }
+    if ((ConvertTo-NormalizedUrl $actual) -ne (ConvertTo-NormalizedUrl $RepoUrl)) {
+        if (-not $actual) { $actual = '<none>' }
+        Write-Error ("Refusing to use the existing checkout at $RepoDir.`n" +
+            "  its 'origin' is: $actual`n" +
+            "  this installer is for: $RepoUrl`n" +
+            "Remove that directory, or point UTJ_DIR / UTJ_REPO_URL at a matching one, and run again.")
+    }
+}
+
+# Detached checkout of the pinned ref. Never `git pull`: that would follow
+# whatever a branch points at today instead of the release that was pinned.
+function Sync-Checkout {
     if (Test-Path (Join-Path $RepoDir '.git')) {
-        Write-Host "-> Updating existing checkout at $RepoDir"
-        git -C $RepoDir pull --ff-only
+        Assert-OriginMatches
+        Write-Host "-> Fetching $UtjRef in $RepoDir"
+        Invoke-Git @('-C', $RepoDir, 'fetch', '--quiet', '--depth', '1', 'origin', $UtjRef)
+        Invoke-Git @('-C', $RepoDir, '-c', 'advice.detachedHead=false', 'checkout', '--quiet', '--detach', 'FETCH_HEAD')
     } else {
-        Write-Host "-> Cloning $RepoUrl -> $RepoDir"
+        if ((Test-Path $RepoDir) -and (Get-ChildItem -LiteralPath $RepoDir -Force | Select-Object -First 1)) {
+            Write-Error "$RepoDir exists and is not a git checkout; refusing to clone into it."
+        }
+        Write-Host "-> Cloning $RepoUrl ($UtjRef) -> $RepoDir"
         $parent = Split-Path -Parent $RepoDir
         if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
-        git clone $RepoUrl $RepoDir
+        Invoke-Git @('-c', 'advice.detachedHead=false', 'clone', '--branch', $UtjRef, '--depth', '1', '--', $RepoUrl, $RepoDir)
     }
+    $short = (& git -C $RepoDir rev-parse --short HEAD)
+    Write-Host "  at $UtjRef ($short)"
 }
 
 function Get-SkillNames {
@@ -105,8 +169,8 @@ function Get-SkillNames {
 }
 
 function Test-IsReparse([string]$Path) {
-    if (-not (Test-Path $Path)) { return $false }
-    $item = Get-Item -LiteralPath $Path -Force
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return $false }
     return ($item.LinkType -eq 'Junction' -or $item.LinkType -eq 'SymbolicLink')
 }
 
@@ -114,8 +178,8 @@ function Remove-Reparse([string]$Path) {
     # Removes a junction/symlink without touching its target. Refuses to touch
     # real files or directories so an existing user folder at the same path is
     # never destroyed.
-    if (-not (Test-Path $Path)) { return $false }
-    $item = Get-Item -LiteralPath $Path -Force
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return $false }
     if ($item.LinkType -eq 'Junction' -or $item.LinkType -eq 'SymbolicLink') {
         $item.Delete()
         return $true
@@ -125,7 +189,7 @@ function Remove-Reparse([string]$Path) {
 }
 
 function New-Junction([string]$LinkPath, [string]$TargetPath) {
-    if (Test-Path $LinkPath) {
+    if (Get-Item -LiteralPath $LinkPath -Force -ErrorAction SilentlyContinue) {
         if (Test-IsReparse $LinkPath) {
             (Get-Item -LiteralPath $LinkPath -Force).Delete()
         } else {
@@ -141,6 +205,13 @@ function Link-Skills([string]$Target, [string]$Style) {
 
     switch ($Style) {
         'per-skill' {
+            # Pass 1: never replace a real file/dir the user already has there.
+            foreach ($skill in Get-SkillNames) {
+                $link = Join-Path $Target $skill
+                if ((Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue) -and -not (Test-IsReparse $link)) {
+                    Write-Error "$link already exists and is not a junction/symlink; refusing to replace it. Move it away and run again."
+                }
+            }
             foreach ($skill in Get-SkillNames) {
                 $link = Join-Path $Target $skill
                 $src  = Join-Path $root $skill
@@ -157,38 +228,84 @@ function Link-Skills([string]$Target, [string]$Style) {
     }
 }
 
-function Unlink-Skills([string]$Target, [string]$Style) {
-    if (-not (Test-Path $Target)) { return }
+function Get-LinkTarget([string]$Path) {
+    # Target of a junction/symlink, or $null when $Path is not one.
+    # Get-Item (not Test-Path) so a dangling link, e.g. after the checkout was deleted, still counts.
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return $null }
+    if ($item.LinkType -ne 'Junction' -and $item.LinkType -ne 'SymbolicLink') { return $null }
+    return [string](@($item.Target)[0])
+}
+
+function Test-SamePath([string]$A, [string]$B) {
+    return ($A.TrimEnd('\', '/') -ieq $B.TrimEnd('\', '/'))
+}
+
+# True when $Path is a link this installer could have made: it points at our
+# skills dir or something inside it. Links to any other checkout (for example
+# a leftover upstream install) are never ours to remove.
+function Test-IsOurSkillLink([string]$Path) {
+    $t = Get-LinkTarget $Path
+    if (-not $t) { return $false }
+    $root = Get-SkillsRoot
+    return ((Test-SamePath $t $root) -or $t.StartsWith($root.TrimEnd('\', '/') + '\', [System.StringComparison]::OrdinalIgnoreCase))
+}
+
+# True when <Target>/<Style> still holds at least one of our links.
+function Test-LinksPresent([string]$Target, [string]$Style) {
+    if (-not (Test-Path -LiteralPath $Target)) { return $false }
     switch ($Style) {
         'per-skill' {
-            $skillsRoot = Get-SkillsRoot
-            if (Test-Path $skillsRoot) {
-                foreach ($skill in Get-SkillNames) {
-                    Remove-Reparse (Join-Path $Target $skill) | Out-Null
-                }
-            } else {
-                # Checkout is gone - scan the target dir for stale links pointing
-                # into our plugin tree so we can still clean up.
-                Get-ChildItem -LiteralPath $Target -Force | ForEach-Object {
-                    if ($_.LinkType -eq 'Junction' -or $_.LinkType -eq 'SymbolicLink') {
-                        if ($_.Target -match 'understand-anything-plugin[\\/]+skills[\\/]+') {
-                            Remove-Reparse $_.FullName | Out-Null
-                        }
-                    }
-                }
+            foreach ($child in Get-ChildItem -LiteralPath $Target -Force) {
+                if (Test-IsOurSkillLink $child.FullName) { return $true }
+            }
+            return $false
+        }
+        'folder' { return (Test-IsOurSkillLink (Join-Path $Target 'understand-anything')) }
+        default  { return $false }
+    }
+}
+
+function Unlink-Skills([string]$Target, [string]$Style) {
+    if (-not (Test-Path -LiteralPath $Target)) { return }
+    switch ($Style) {
+        'per-skill' {
+            # Scan the target dir instead of listing the checkout's skills, so
+            # this still cleans up after the checkout has been deleted - and
+            # only ever removes links that point into our own skills dir.
+            foreach ($child in @(Get-ChildItem -LiteralPath $Target -Force)) {
+                if (Test-IsOurSkillLink $child.FullName) { Remove-Reparse $child.FullName | Out-Null }
             }
         }
         'folder' {
-            Remove-Reparse (Join-Path $Target 'understand-anything') | Out-Null
+            $link = Join-Path $Target 'understand-anything'
+            if (Test-IsOurSkillLink $link) { Remove-Reparse $link | Out-Null }
         }
     }
 }
 
+# The universal plugin root link is read by the SKILL.md files. Refuse to
+# adopt a link that points somewhere else (a leftover upstream install would
+# make the skills run that code instead of this checkout).
+function Assert-PluginLinkUsable {
+    $want = Get-PluginRoot
+    if (-not (Get-Item -LiteralPath $PluginLink -Force -ErrorAction SilentlyContinue)) { return }
+    $have = Get-LinkTarget $PluginLink
+    if (-not $have) {
+        Write-Error "$PluginLink exists and is not a junction/symlink; refusing to touch it."
+    }
+    if (-not (Test-SamePath $have $want)) {
+        Write-Error ("$PluginLink already points to $have,`n" +
+            "not to this install ($want).`n" +
+            "If it is a leftover from another install, remove it (Remove-Item '$PluginLink') and run again.")
+    }
+}
+
 function Link-Plugin-Root {
-    if (Test-Path $PluginLink) {
-        Write-Host "  * $PluginLink already exists, leaving as-is"
+    if (Get-Item -LiteralPath $PluginLink -Force -ErrorAction SilentlyContinue) {
+        Write-Host "  * $PluginLink already linked"
     } else {
-        $src = Join-Path $RepoDir 'understand-anything-plugin'
+        $src = Get-PluginRoot
         New-Item -ItemType Junction -Path $PluginLink -Target $src | Out-Null
         Write-Host "  OK $PluginLink -> $src"
     }
@@ -201,7 +318,9 @@ function ConvertTo-FileUri([string]$Path) {
 
 function Cmd-Install([string]$Id) {
     $cfg = Resolve-Platform $Id
-    Clone-Or-Update
+    Assert-ValidInputs
+    Sync-Checkout
+    Assert-PluginLinkUsable
     Write-Host "-> Linking skills for $Id ($($cfg.Style) -> $($cfg.Target))"
     Link-Skills $cfg.Target $cfg.Style
     Write-Host '-> Linking universal plugin root'
@@ -211,7 +330,7 @@ function Cmd-Install([string]$Id) {
         Write-Host '-> Creating Kiro agent configuration'
         $agentsDir = Join-Path $HOME '.kiro\agents'
         if (-not (Test-Path $agentsDir)) { New-Item -ItemType Directory -Path $agentsDir | Out-Null }
-        $pluginRoot = Join-Path $RepoDir 'understand-anything-plugin'
+        $pluginRoot = Get-PluginRoot
 
         # Build the "resources" list dynamically from the agent definitions in
         # the repo so it never drifts as agents are added or removed.
@@ -222,7 +341,7 @@ function Cmd-Install([string]$Id) {
         )
         $agent = [ordered]@{
             name        = 'understand'
-            description = 'Analyze codebase into interactive knowledge graph - Understand Anything'
+            description = 'Analyze codebase into interactive knowledge graph - Understand the Job'
             prompt      = ConvertTo-FileUri (Join-Path $pluginRoot 'skills\understand\SKILL.md')
             tools       = @('read', 'write', 'shell', 'grep', 'glob', 'code', 'subagent')
             resources   = $resources
@@ -233,7 +352,7 @@ function Cmd-Install([string]$Id) {
         Write-Host "  OK $agentJson"
     }
 
-    Write-Host "`nOK Installed Understand-Anything for $Id"
+    Write-Host "`nOK Installed Understand the Job $UtjRef for $Id"
     Write-Host '  Restart your CLI or IDE to pick up the skills.'
     if ($Id -eq 'codex') {
         Write-Host "`n  Tip: Codex invokes skills with `$ instead of / - type `$understand, not /understand."
@@ -258,8 +377,25 @@ function Cmd-Uninstall([string]$Id) {
             Write-Host "  OK removed $agentJson"
         }
     }
-    if (Remove-Reparse $PluginLink) {
-        Write-Host "  OK removed $PluginLink"
+    # The plugin root link is shared by every platform: keep it while any other
+    # platform still has skill links in place. Platforms that share this one's
+    # target dir and style share the very same links, so they went with it.
+    $others = @()
+    foreach ($oid in $Platforms.Keys) {
+        if ($oid -eq $Id) { continue }
+        $o = $Platforms[$oid]
+        if ((Test-SamePath $o.Target $cfg.Target) -and $o.Style -eq $cfg.Style) { continue }
+        if (Test-LinksPresent $o.Target $o.Style) { $others += $oid }
+    }
+    if ($others.Count -gt 0) {
+        Write-Host "  * kept $PluginLink - still used by: $($others -join ', ')"
+    } elseif (Get-Item -LiteralPath $PluginLink -Force -ErrorAction SilentlyContinue) {
+        $have = Get-LinkTarget $PluginLink
+        if ($have -and (Test-SamePath $have (Get-PluginRoot))) {
+            if (Remove-Reparse $PluginLink) { Write-Host "  OK removed $PluginLink" }
+        } else {
+            Write-Host "  * left $PluginLink alone - it does not point at this install"
+        }
     }
     if (Test-Path $RepoDir) {
         Write-Host "`nThe checkout at $RepoDir was kept (other platforms may still use it)."
@@ -271,8 +407,9 @@ function Cmd-Update {
     if (-not (Test-Path (Join-Path $RepoDir '.git'))) {
         Write-Error "No installation found at $RepoDir. Run install first."
     }
-    git -C $RepoDir pull --ff-only
-    Write-Host 'OK Updated.'
+    Assert-ValidInputs
+    Sync-Checkout
+    Write-Host "OK Updated (pinned to $UtjRef)."
 }
 
 if ($Help) { Show-Usage; return }

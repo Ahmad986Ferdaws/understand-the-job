@@ -1,12 +1,12 @@
-# Contributing to Understand Anything
+# Contributing to Understand the Job
 
-Thank you for your interest in contributing to Understand Anything! This document provides guidelines and instructions for contributing to the project.
+Thank you for your interest in contributing to Understand the Job! This project is a hardened fork of [Understand-Anything](https://github.com/Egonex-AI/Understand-Anything) (MIT). This document provides guidelines and instructions for contributing to it.
 
 ## 🌟 Ways to Contribute
 
 - **Bug Reports**: Found a bug? Open an issue with detailed reproduction steps
 - **Feature Requests**: Have an idea? Share it in the issues section
-- **Documentation**: Improve or translate documentation
+- **Documentation**: Improve the documentation
 - **Code**: Fix bugs, add features, or improve performance
 - **Testing**: Write tests to improve code coverage
 
@@ -22,14 +22,15 @@ Thank you for your interest in contributing to Understand Anything! This documen
 
 1. **Fork and Clone**
    ```bash
-   git clone https://github.com/YOUR_USERNAME/Understand-Anything.git
-   cd Understand-Anything
+   git clone https://github.com/YOUR_USERNAME/understand-the-job.git
+   cd understand-the-job
    ```
 
 2. **Install Dependencies**
    ```bash
-   pnpm install
+   pnpm install --frozen-lockfile
    ```
+   Use a plain `pnpm install` only when your change adds or updates a dependency, and commit the updated `pnpm-lock.yaml` with it.
 
 3. **Build Core Package**
    ```bash
@@ -46,6 +47,23 @@ Thank you for your interest in contributing to Understand Anything! This documen
    ```bash
    pnpm dev:dashboard
    ```
+
+## 🔒 Security rules
+
+This fork exists to be safe to run on code you did not write. The **Security model** section of the [README](README.md#security-model) is a promise to users, so:
+
+> **Any change that runs code, writes files, or touches the network must keep the Security model in README true.**
+
+In practice:
+
+- Treat everything read from an analyzed project as untrusted data. Agent prompts keep their `## Untrusted input` section, and agents get only the tools they need.
+- Anything that reads or writes the data directory (`.ua/` or `.understand-anything/`) goes through the safe-data-directory check first.
+- A repository must never be able to switch something on. Opt-ins live in `~/.understand-the-job/`, not in project files; hooks may only suggest.
+- No downloading and running code at run time, no network calls from the dashboard page, and no new remote hosts in the Content-Security-Policy.
+- Pin what you add: GitHub Actions to a full commit SHA, dependencies through the lockfile.
+- If a change makes a sentence in the Security model false, update the sentence and say why in the PR description — and expect that PR to get extra scrutiny.
+
+Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 
 ## 📝 Development Workflow
 
@@ -71,6 +89,9 @@ git checkout -b docs/update-readme     # For documentation
 # Run all tests
 pnpm --filter @understand-anything/core test
 pnpm test
+
+# Python helper tests (the same loop CI uses; `tests/` has no __init__.py)
+python3 -m unittest $(git ls-files 'tests/**/test_*.py' | sed 's#/#.#g; s#\.py$##') -v
 
 # Run linter
 pnpm lint
@@ -183,7 +204,7 @@ Run both commands for the complete test coverage used by CI. The root Vitest con
 
 ### Tech Stack
 
-TypeScript, pnpm workspaces, React 18, Vite, TailwindCSS v4, React Flow, Zustand, web-tree-sitter, Fuse.js, Zod, Dagre
+TypeScript, pnpm workspaces, React 19, Vite, TailwindCSS v4, React Flow, Zustand, web-tree-sitter, Fuse.js, Zod, Dagre
 
 ### File Organization
 
@@ -202,21 +223,6 @@ understand-anything-plugin/
 ├── src/                   # Plugin skills implementation
 ├── agents/                # AI agent prompts
 └── skills/                # Skill definitions
-```
-
-## 🌍 Translation Guidelines
-
-### Adding a New Language
-
-1. Create `README.{language-code}.md` (e.g., `README.fr-FR.md`)
-2. Translate all sections while maintaining formatting
-3. Update main `README.md` to include language link
-4. Keep technical terms in English where appropriate
-5. Ensure all links still work
-
-Example:
-```markdown
-<a href="README.md">English</a> | <a href="README.fr-FR.md">Français</a>
 ```
 
 ## 🐛 Bug Reports
@@ -248,6 +254,8 @@ Before submitting a PR, ensure:
 - [ ] Core tests and root skill/dashboard tests pass (`pnpm --filter @understand-anything/core test` and `pnpm test`)
 - [ ] New code has test coverage
 - [ ] Documentation is updated (if needed)
+- [ ] The README Security model is still true (see Security rules above)
+- [ ] Version bumped in all six manifests listed in `CLAUDE.md` (only if the change is user-visible)
 - [ ] Commit messages follow convention
 - [ ] PR description clearly explains changes
 - [ ] No console.log or debug code left behind
@@ -280,4 +288,4 @@ Contributors will be recognized in:
 
 ---
 
-**Thank you for contributing to Understand Anything! Your contributions help make code understanding accessible to everyone.** 🚀
+**Thank you for contributing to Understand the Job! Your contributions help make code understanding accessible to everyone.** 🚀

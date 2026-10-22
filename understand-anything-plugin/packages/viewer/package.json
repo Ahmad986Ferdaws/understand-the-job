@@ -1,12 +1,12 @@
 {
   "name": "understand-anything-viewer",
-  "version": "2.9.7",
+  "version": "1.0.0",
   "description": "Standalone read-only viewer for Understand-Anything knowledge graphs — no Claude Code or LLM required.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Egonex-AI/Understand-Anything.git",
+    "url": "git+https://github.com/Ahmad986Ferdaws/understand-the-job.git",
     "directory": "understand-anything-plugin/packages/viewer"
   },
   "bin": {

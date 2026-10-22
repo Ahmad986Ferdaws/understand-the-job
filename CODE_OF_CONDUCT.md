@@ -19,9 +19,9 @@ identity.
 
 ## Reporting
 
-If you see behavior that violates this code, please open a private email to
-the maintainer listed in the repository profile, or use GitHub's
-[private vulnerability / abuse reporting](https://docs.github.com/en/communities/maintaining-your-safety-on-github/reporting-abuse-or-spam).
+If you see behavior that violates this code, contact the maintainer through
+GitHub, or use GitHub's
+[abuse reporting](https://docs.github.com/en/communities/maintaining-your-safety-on-github/reporting-abuse-or-spam).
 
 Maintainers will review reports and take whatever action they think is
 appropriate — typically a private warning, sometimes a temporary or permanent

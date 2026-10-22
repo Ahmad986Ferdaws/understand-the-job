@@ -30,7 +30,7 @@ the deterministic batch payload, not a token estimate.
 
 ## Run the benchmark
 
-From an Understand Anything checkout:
+From an Understand the Job checkout:
 
 ```bash
 corepack pnpm install --frozen-lockfile
@@ -89,7 +89,7 @@ publish them without reviewing and sanitizing them.
 
 For results that another contributor can reproduce:
 
-1. Record an immutable commit for both Understand Anything and the subject
+1. Record an immutable commit for both Understand the Job and the subject
    repository. The report captures both commits when the directories are Git
    worktrees.
 2. Use clean worktrees where possible. The report records `dirty: true` when

@@ -1,12 +1,12 @@
 {
-  "name": "understand-anything",
+  "name": "understand-the-job",
   "description": "AI-powered codebase understanding — analyze, visualize, and explain any project",
-  "version": "2.9.7",
+  "version": "1.0.0",
   "author": {
-    "name": "Egonex"
+    "name": "Ahmad986Ferdaws"
   },
-  "homepage": "https://github.com/Egonex-AI/Understand-Anything",
-  "repository": "https://github.com/Egonex-AI/Understand-Anything",
+  "homepage": "https://github.com/Ahmad986Ferdaws/understand-the-job",
+  "repository": "https://github.com/Ahmad986Ferdaws/understand-the-job",
   "license": "MIT",
   "keywords": ["codebase-analysis", "knowledge-graph", "architecture", "onboarding", "dashboard"],
   "skills": "./understand-anything-plugin/skills/",

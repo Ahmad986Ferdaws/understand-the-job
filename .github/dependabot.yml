@@ -1,0 +1,25 @@
+# Weekly dependency PRs. Updates are the only way pinned versions (workflow
+# action SHAs, lockfile entries) move, so they are reviewed like any other change.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Let a brand-new release sit for a week before proposing it, so a
+    # hijacked or yanked release is more likely to be caught first.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "npm"
+    # pnpm workspace: the root plus every workspace package.
+    directories:
+      - "/"
+      - "/understand-anything-plugin"
+      - "/understand-anything-plugin/packages/*"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5

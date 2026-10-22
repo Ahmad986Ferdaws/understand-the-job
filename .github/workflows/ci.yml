@@ -9,6 +9,11 @@ on:
   push:
     branches: [main]
 
+# Least privilege: CI only needs to read the repository. Jobs that need more
+# must opt in per job rather than inheriting a broad default token.
+permissions:
+  contents: read
+
 # Cancel any in-flight CI for the same ref when a new commit is pushed —
 # saves runner minutes and keeps the latest commit's status the only one
 # anyone reads. `github.ref` is a controlled value (refs/heads/* or
@@ -25,22 +30,26 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      # Third-party actions are pinned to a full commit SHA (the tag is kept as
+      # a comment). Dependabot bumps these weekly — see .github/dependabot.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.x'
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Lint
         run: pnpm lint
@@ -60,5 +69,13 @@ jobs:
       - name: Test skill
         run: pnpm test
 
+      # Runs every tests/**/test_*.py module by dotted name, so a new Python
+      # test file is picked up without editing this workflow. (tests/ has no
+      # __init__.py, so `unittest discover -s tests` cannot import it.)
       - name: Test Python skill helpers
-        run: python -m unittest tests.skill.understand.test_merge_batch_graphs tests.skill.understand.test_merge_subdomain_graphs tests.skill.knowledge.test_parse_knowledge_base -v
+        shell: bash
+        run: |
+          modules=$(git ls-files 'tests/**/test_*.py' | sed 's#/#.#g; s#\.py$##')
+          test -n "$modules" || { echo "no Python test modules found" >&2; exit 1; }
+          echo "$modules"
+          python -m unittest $modules -v

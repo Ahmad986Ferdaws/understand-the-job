@@ -1,16 +1,16 @@
 {
-  "name": "understand-anything",
+  "name": "understand-the-job",
   "private": true,
   "type": "module",
   "description": "An open-source tool combining LLM intelligence + static analysis to produce interactive dashboards for understanding codebases.",
   "license": "MIT",
-  "homepage": "https://github.com/Egonex-AI/Understand-Anything#readme",
+  "homepage": "https://github.com/Ahmad986Ferdaws/understand-the-job#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Egonex-AI/Understand-Anything.git"
+    "url": "git+https://github.com/Ahmad986Ferdaws/understand-the-job.git"
   },
   "bugs": {
-    "url": "https://github.com/Egonex-AI/Understand-Anything/issues"
+    "url": "https://github.com/Ahmad986Ferdaws/understand-the-job/issues"
   },
   "keywords": [
     "claude-code",
