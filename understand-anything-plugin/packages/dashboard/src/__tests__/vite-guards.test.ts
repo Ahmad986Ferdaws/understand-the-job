@@ -185,7 +185,7 @@ describe("dev server data endpoints", () => {
     const graph = (await get(port, `/knowledge-graph.json?token=${TOKEN}`)).json() as {
       nodes: Array<{ filePath: string }>;
     };
-    expect(graph.nodes[0].filePath).toBe(path.join("src", "a.ts"));
+    expect(graph.nodes[0].filePath).toBe("src/a.ts");
 
     const ok = await fileContent(port, "src/a.ts");
     expect(ok.status).toBe(200);

@@ -238,7 +238,7 @@ describe("symlink-safe file access", () => {
       JSON.stringify({ nodes: [{ id: "x", filePath: join(root, "src", "a.ts") }] }),
     );
     const out = guards.readSanitizedJson(join(root, ".ua"), "knowledge-graph.json", root);
-    expect(out.nodes[0].filePath).toBe(join("src", "a.ts"));
+    expect(out.nodes[0].filePath).toBe("src/a.ts");
   });
 
   it("caches the graph allowlist until the graph file changes", () => {
